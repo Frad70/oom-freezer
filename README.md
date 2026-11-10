@@ -146,7 +146,7 @@ For a `FORGOTTEN` process:
 1. If `FREEZE_ACTIVE_CMD` is set, it runs (at most once per poll). Exit status
    1 permits the freeze. Exit 0 means the process is in use and resets its idle
    period. Any other exit status, a crash, a timeout or a missing program also
-   blocks the freeze and is logged.
+   blocks the freeze, resets the idle period, reports `active-cmd` and is logged.
 2. At most one action per poll, and at most one per process every 15 minutes.
 3. Dry-run logs `dry-run: would freeze`. Otherwise a Gradle daemon gets SIGTERM
    (a frozen Gradle daemon hangs the next build, and a new daemon starts by
