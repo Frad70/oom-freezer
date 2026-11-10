@@ -147,8 +147,8 @@ static int fz_sacred(const char *comm, int pid) {
     return 0;
 }
 
-/* Game = a process holds a /dev/dri node open. WAYLAND_DISPLAY is useless
- * for this: every descendant inherits it, including a build from a terminal. */
+/* A process with a /dev/dri node open draws on the GPU: a GUI or a game.
+ * WAYLAND_DISPLAY cannot tell this, every descendant of a session inherits it. */
 static int holds_gpu(int pid) {
     char dir[64];
     snprintf(dir, sizeof dir, "/proc/%d/fd", pid);
@@ -175,7 +175,7 @@ static int holds_gpu(int pid) {
  * is reversible: oom-freezer thaw resumes the process, pages fault back in.
  *
  * Why MADV_PAGEOUT rather than a single memory.reclaim: in cgroup v2 memory
- * charges do NOT move with a process. A fresh cgroup after moving the pid
+ * charges do not move with a process. A fresh cgroup after moving the pid
  * shows memory.current=0, and memory.reclaim returns EAGAIN without freeing
  * anything (RSS was measured unchanged before and after). Reclaim stays
  * the second step: after a thaw, pages come back charged to our cgroup, and
@@ -373,7 +373,7 @@ static void fz_label(const fz_config *c, const fz_proc *p, const char *kind, cha
     xcpy(out, cap, p->comm[0] ? p->comm : fz_base(p->exe));
 }
 
-/* Never touched: our own tree, sacred names, the protect list, the explicit
+/* Never touched: our own tree, built-in system names, the protect list, the explicit
  * never list and anything holding a /dev/dri node open (a GUI app such as a
  * game launcher with a running game is also a large java process). */
 static const char *fz_never(const fz_config *c, const fz_proc *p, const char *label) {
@@ -402,9 +402,6 @@ static void fz_cgroup_of(int pid, char *out, size_t cap) {
     xcpy(out, cap, p);
 }
 
-/* Whether the pid is frozen right now. Being inside the freezer root is not enough:
- * after a thaw without a move back to its own cgroup the process stays there,
- * and it must become a candidate again, or a thawed process could never be frozen again. */
 /* cgroup-relative path of FZ_ROOT, compared by its own length */
 static int fz_in_root(const char *cg) {
     const char *mnt = FZ_MNT, *root = FZ_ROOT;
@@ -415,6 +412,9 @@ static int fz_in_root(const char *cg) {
     return n && !strncmp(cg, root, n) && cg[n] == '/';
 }
 
+/* Whether the pid is frozen right now. Being inside the freezer root is not
+ * enough: after a thaw without a move back the process stays there, and it must
+ * become a candidate again. */
 static int fz_is_frozen(int pid) {
     char cg[PATHMAX], p[PATHMAX + 32], b[32];
     fz_cgroup_of(pid, cg, sizeof cg);

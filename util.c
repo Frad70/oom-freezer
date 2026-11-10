@@ -18,10 +18,9 @@
 
 /* ================================ log ===================================== */
 
-/* Bounded append to a buffer. A plain len += snprintf(...) is a trap:
- * snprintf returns the length it WANTED to write, not what it wrote. Once len
- * passes the buffer size, (cap - len) underflows, buf+len points past the
- * array, and the next write corrupts the stack. As root. */
+/* Bounded append to a buffer. snprintf returns the length it would have
+ * written, so a plain len += snprintf(...) lets (cap - len) underflow once the
+ * buffer is full and the next write lands past the array. */
 void appendf(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
     if (*len >= cap - 1) return;
     va_list ap; va_start(ap, fmt);
@@ -128,10 +127,10 @@ void notify(const char *msg) {
 }
 
 /* ============================== rate-limit =============================== */
-/* In memory, not files in /run: files had one advantage, surviving a daemon
- * restart, and that was exactly the problem (the limit stuck after a restart). */
+/* In memory on purpose: a limit that survived a restart would block the first
+ * action after it. */
 
-typedef struct { char key[112]; long at; } rl_slot;   /* unit names up to 96 bytes: a shorter key would never match in strcmp */
+typedef struct { char key[112]; long at; } rl_slot;
 static rl_slot g_rl[64];
 
 int rate_ok(const char *key, int secs) {
