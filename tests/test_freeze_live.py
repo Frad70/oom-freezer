@@ -22,6 +22,10 @@ def write(path, value):
 
 
 def main():
+    if not Path('/sys/fs/cgroup/cgroup.controllers').exists():
+        print('SKIP: live test needs cgroup v2'); return
+    if os.geteuid() != 0 and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode:
+        print('SKIP: live test needs root or sudo without a password'); return
     cg = Path('/sys/fs/cgroup') / f'oom-freezer-test-{os.getpid()}'
     if cg.exists():
         raise RuntimeError('test cgroup already exists; refusing to reuse it')
