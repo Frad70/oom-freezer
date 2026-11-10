@@ -106,7 +106,6 @@ executable path, case-insensitive, comma-separated, at most 32 entries of up
 to 31 bytes; extra entries are dropped with a warning. An unquoted value ends
 at `#`, so quote a value that contains `#`.
 
-
 ## How it decides
 
 Every `FREEZE_POLL_S` seconds the daemon reads `/proc`. For each process the
@@ -176,7 +175,8 @@ with a pointer to `oom-freezer thaw`.
   whatever the config says.
 - Processes whose name contains a built-in system name: pipewire, wireplumber,
   pulse, kwin, plasma, Xorg, Xwayland, mutter, gnome-shell, sddm, gdm, systemd,
-  dbus, sshd, init, NetworkManager, wayland, polkit, sway, weston, aegis-oom, aegis-reaper.
+  dbus, sshd, init, NetworkManager, wayland, polkit, sway, weston, aegis-oom,
+  aegis-reaper.
 - `FREEZE_NEVER` matches.
 - `FREEZE_PROTECT` names (exact comm or label), and every descendant of a
   protected process up to the next shell, terminal multiplexer, login or
