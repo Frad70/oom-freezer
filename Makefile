@@ -10,8 +10,9 @@ oom-freezer: oom-freezer.c util.c util.h
 test-freezer: test_freezer.c oom-freezer.c util.c util.h
 	$(CC) $(CFLAGS) -o test-freezer test_freezer.c util.c
 
-test: test-freezer
+test: test-freezer oom-freezer
 	./test-freezer
+	bash tests/cases_idle.sh ./oom-freezer
 
 test-live:
 	python3 tests/test_freeze_live.py
