@@ -130,6 +130,12 @@ static int fz_is_ancestor(int pid) {
     return 0;
 }
 
+/* PID 1, this process, its parent chain and its session leader are never
+ * touched, whatever the config says. */
+static int fz_own(int pid) {
+    return pid <= 1 || pid == getpid() || pid == getppid() || pid == getsid(0) || fz_is_ancestor(pid);
+}
+
 static int fz_sacred(const char *comm, int pid) {
     static const char *sacred[] = {
         "pipewire", "wireplumber", "pulse", "kwin", "plasma", "Xorg", "Xwayland",
@@ -137,7 +143,7 @@ static int fz_sacred(const char *comm, int pid) {
         "NetworkManager", "wayland", "polkit", "sway", "weston", "aegis-oom", "aegis-reaper", 0
     };
     for (int i = 0; sacred[i]; i++) if (strstr(comm, sacred[i])) return 1;
-    if (pid > 0 && (pid == getpid() || fz_is_ancestor(pid))) return 1;
+    if (pid > 0 && fz_own(pid)) return 1;
     return 0;
 }
 
@@ -371,7 +377,7 @@ static void fz_label(const fz_config *c, const fz_proc *p, const char *kind, cha
  * never list and anything holding a /dev/dri node open (a GUI app such as a
  * game launcher with a running game is also a large java process). */
 static const char *fz_never(const fz_config *c, const fz_proc *p, const char *label) {
-    if (p->pid <= 1 || p->pid == getpid() || fz_is_ancestor(p->pid)) return "own-tree";
+    if (fz_own(p->pid)) return "own-tree";
     if (fz_sacred(p->comm, p->pid)) return "sacred";
     const char *hit = fz_list_hit(&c->never, p->hay);
     if (hit) return hit;
@@ -891,7 +897,7 @@ static int fz_thaw(const fz_config *c, const char *spec) {
 static int fz_freeze_pid(const fz_config *c, int pid) {
     static fz_proc p;
     if (fz_read(pid, &p) != 0) { printf("No such process: %d\n", pid); return 1; }
-    if (p.pid <= 1 || p.pid == getpid() || fz_is_ancestor(p.pid)) {
+    if (fz_own(p.pid)) {
         printf("Refused: %d belongs to the daemon's own process tree.\n", pid);
         return 1;
     }
@@ -1088,6 +1094,27 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
     fz_state_write(c, st, stlen);
 }
 
+/* Refuse to start on a system that cannot freeze: no cgroup v2, a kernel
+ * without cgroup.freeze (before 5.2), or no write access when acting. */
+static int fz_support(int need_write) {
+    char p[PATHMAX + 64], self[PATHMAX];
+    snprintf(p, sizeof p, "%s/cgroup.controllers", FZ_MNT);
+    if (access(p, F_OK) != 0) {
+        lg(LOG_ERR, "cgroup v2 is required: %s is missing (cgroup v1 or no /sys/fs/cgroup)", p);
+        return -1;
+    }
+    fz_cgroup_of((int)getpid(), self, sizeof self);
+    if (self[0] && strcmp(self, "/")) {
+        snprintf(p, sizeof p, "%s%s/cgroup.freeze", FZ_MNT, self);
+        if (access(p, F_OK) != 0) { lg(LOG_ERR, "the kernel has no cgroup freezer (%s is missing, needs Linux 5.2)", p); return -1; }
+    }
+    if (need_write && access(FZ_MNT, W_OK) != 0) {
+        lg(LOG_ERR, "no write access to %s: run as root on a writable cgroup hierarchy, or set FREEZE_DRYRUN=1", FZ_MNT);
+        return -1;
+    }
+    return 0;
+}
+
 /* CLI "list": the recovery registry with the live state of each cgroup. */
 static int fz_list(const fz_config *c) {
     char reg[PATHMAX];
@@ -1175,6 +1202,7 @@ int main(int argc, char **argv) {
     signal(SIGHUP, on_hup);
     signal(SIGPIPE, SIG_IGN);
 
+    if (fz_support(needs_arg || !cfg.dryrun) != 0) return 1;
     if (!strcmp(cmd, "thaw")) return fz_thaw(&cfg, arg) >= 0 ? 0 : 1;
     if (!strcmp(cmd, "freeze")) return fz_freeze_pid(&cfg, freeze_pid);
     if (!strcmp(cmd, "once")) { freeze_check(&cfg, &state); return 0; }

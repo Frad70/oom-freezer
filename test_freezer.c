@@ -234,6 +234,20 @@ int main(void) {
     EXPECT(fz_pageout((int)getpid()) < 0 && madvise_calls == 1, "pageout is not retried after ENOSYS");
     fz_madvise = sys_process_madvise; fz_no_pageout = 0;
 
+    static fz_proc own = {0};
+    own.pid = (int)getsid(0);
+    EXPECT(fz_own(1) && fz_own((int)getpid()) && fz_own((int)getppid()) && fz_own(own.pid),
+           "PID 1, self, parent and session leader are always protected");
+    EXPECT(own.pid <= 1 || !strcmp(fz_never(c, &own, "x"), "own-tree"), "session leader is reported as own tree");
+    char fakemnt[] = "/tmp/oom-freezer-mnt-XXXXXX", ctl[PATHMAX];
+    EXPECT(mkdtemp(fakemnt), "fake mount"); test_cgroup_mnt = fakemnt;
+    EXPECT(fz_support(0) < 0, "missing cgroup v2 is refused at start");
+    snprintf(ctl, sizeof ctl, "%s/cgroup.controllers", fakemnt); registry_text(ctl, "memory\n");
+    char self[PATHMAX]; fz_cgroup_of((int)getpid(), self, sizeof self);
+    if (self[0] && strcmp(self, "/")) EXPECT(fz_support(0) < 0, "a kernel without cgroup.freeze is refused at start");
+    unlink(ctl); rmdir(fakemnt);
+    test_cgroup_mnt = "/proc/oom-freezer-tests-never-created";
+
     int pipes[2]; EXPECT(!pipe(pipes), "pipe"); pid_t child = fork();
     if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
     close(pipes[0]); EXPECT(child > 0, "child fixture");
