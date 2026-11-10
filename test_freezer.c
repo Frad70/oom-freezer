@@ -16,7 +16,7 @@ static void registry_text(const char *path, const char *value) {
 }
 
 static const char *fake_root, *fail_dir, *fail_suffix, *fail_value;
-static int fake_events = 1;
+static int fake_events = 1, fail_after;
 
 /* Stands in for cgroupfs: plain files, events follow cgroup.freeze, and a
  * write matching fail_dir, fail_suffix and fail_value fails with EIO. */
@@ -26,7 +26,8 @@ static int fake_write(const char *path, const char *val) {
     }
     size_t pl = strlen(path);
     if (fail_suffix && !strncmp(path, fail_dir, strlen(fail_dir)) && pl >= strlen(fail_suffix) &&
-        !strcmp(path + pl - strlen(fail_suffix), fail_suffix) && (!fail_value || !strcmp(val, fail_value))) {
+        !strcmp(path + pl - strlen(fail_suffix), fail_suffix) && (!fail_value || !strcmp(val, fail_value)) &&
+        fail_after-- <= 0) {
         errno = EIO; return -1;
     }
     int procs = pl >= 12 && !strcmp(path + pl - 12, "cgroup.procs");
@@ -66,8 +67,11 @@ static int mkdirs(char *path) {
 static void rollback_tests(fz_config *c, const char *state) {
     int pipes[2]; if (pipe(pipes)) { failures++; return; }
     pid_t child = fork();
-    if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
+    if (!child) { close(pipes[1]); if (fork() < 0) _exit(1); char b; (void)read(pipes[0], &b, 1); _exit(0); }
     close(pipes[0]);
+    int tree[4], tn = 0;
+    for (int w = 0; w < 100 && (tn = fz_tree(child, tree, 4)) < 2; w++) usleep(10000);
+    EXPECT(tn == 2, "fixture tree has a parent and a child");
     char orig[PATHMAX]; fz_cgroup_of(child, orig, sizeof orig);
     if (!orig[0] || !fz_valid_original(orig)) {
         puts("SKIP: rollback tests need a cgroup v2 path in /proc/self/cgroup");
@@ -90,16 +94,17 @@ static void rollback_tests(fz_config *c, const char *state) {
     snprintf(reg, sizeof reg, "%s/frozen", state);
     char pidline[32]; snprintf(pidline, sizeof pidline, "%d\n", (int)child);
 
-    struct { const char *suffix, *value; int events, registry_broken; const char *what; } cases[] = {
-        {"cgroup.procs", 0, 1, 0, "migration failure"},
-        {"cgroup.freeze", "1", 1, 0, "freeze write failure"},
-        {0, 0, 0, 0, "freeze not confirmed"},
-        {0, 0, 1, 1, "recovery registry failure"},
+    struct { const char *suffix, *value; int after, events, registry_broken; const char *what; } cases[] = {
+        {"cgroup.procs", 0, 0, 1, 0, "migration failure"},
+        {"cgroup.procs", 0, 1, 1, 0, "partial migration"},
+        {"cgroup.freeze", "1", 0, 1, 0, "freeze write failure"},
+        {0, 0, 0, 0, 0, "freeze not confirmed"},
+        {0, 0, 0, 1, 1, "recovery registry failure"},
     };
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         clear_leaf(leaf); unlink(origprocs); unlink(reg);
         if (cases[i].registry_broken && symlink("/dev/full", reg)) failures++;
-        fail_dir = root; fail_suffix = cases[i].suffix; fail_value = cases[i].value; fake_events = cases[i].events;
+        fail_dir = root; fail_suffix = cases[i].suffix; fail_value = cases[i].value; fail_after = cases[i].after; fake_events = cases[i].events;
         char m[128];
         snprintf(m, sizeof m, "%s: freeze reports failure", cases[i].what);
         EXPECT(fz_freeze(c, &p, "watched", "fixture", "test") < 0, m);
@@ -125,6 +130,45 @@ static void rollback_tests(fz_config *c, const char *state) {
     unlink(subtree); rmdir(root); rmdir(mnt);
     fz_write = fz_write_file; fz_wait_ms = 5000;
     close(pipes[1]); waitpid(child, NULL, 0);
+}
+
+/* The whole scan loop in dry-run: two idle watched fixtures and an activity
+ * check that permits both. A rate-limited candidate must not take the single
+ * check of a poll from the next one. */
+static void scan_tests(fz_config *c, const char *state) {
+    char dir[] = "/tmp/oom-freezer-scan-XXXXXX", hook[PATHMAX], seen[PATHMAX], body[2 * PATHMAX];
+    EXPECT(mkdtemp(dir), "scan fixture dir");
+    snprintf(hook, sizeof hook, "%s/check", dir);
+    snprintf(seen, sizeof seen, "%s/seen", dir);
+    snprintf(body, sizeof body, "#!/bin/sh\necho \"$1\" >> %s\nexit 1\n", seen);
+    registry_text(hook, body); chmod(hook, 0700);
+    int pipes[2]; if (pipe(pipes)) { failures++; return; }
+    pid_t kids[2];
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (!kids[i]) { close(pipes[1]); if (chdir(dir)) _exit(1); char b; (void)read(pipes[0], &b, 1); _exit(0); }
+    }
+    close(pipes[0]);
+    usleep(100000);
+    cfg_defaults(c); c->state_dir = state;
+    cfg_apply(c, "FREEZE_WATCH", dir + 5);
+    cfg_apply(c, "FREEZE_ACTIVE_CMD", hook);
+    c->min_rss_mb = 0; c->uptime_min = 0; c->idle_min = 0; c->cpu_idle_pct = 100; c->poll_s = 0;
+    static fz_state fs;
+    for (int i = 0; i < 3; i++) { freeze_check(c, &fs); sleep(1); }
+    char out[256] = "", want[32];
+    read_file(seen, out, sizeof out);
+    for (int i = 0; i < 2; i++) {
+        snprintf(want, sizeof want, "%d\n", (int)kids[i]);
+        EXPECT(strstr(out, want), "each idle candidate gets its activity check within three polls");
+    }
+    char st[PATHMAX]; snprintf(st, sizeof st, "%s/freeze.state", state);
+    EXPECT(file_has(st, "mode dry-run") && file_has(st, "kind=watched"), "scan writes candidates to freeze.state");
+    unlink(st);
+    close(pipes[1]);
+    for (int i = 0; i < 2; i++) waitpid(kids[i], NULL, 0);
+    unlink(hook); unlink(seen); rmdir(dir);
+    cfg_defaults(c); c->state_dir = state;
 }
 
 int main(void) {
@@ -316,6 +360,7 @@ int main(void) {
     EXPECT(lr == 0 && strstr(out, "paper.jar") && strstr(out, "2048 MiB") && strstr(out, "game-server"),
            "list shows name, kind and size from the registry");
     unlink(path);
+    scan_tests(c, state);
     rollback_tests(c, state);
     unlink(path); snprintf(path, sizeof path, "%s/frozen.lock", state); unlink(path); rmdir(state);
     if (failures) return 1;

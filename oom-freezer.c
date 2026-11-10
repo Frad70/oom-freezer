@@ -998,18 +998,20 @@ static int fz_active(const fz_config *c, const fz_proc *p, const fz_cand *k) {
     return 1;
 }
 
-/* Returns 1 when an action was taken (or would be, in dry-run). */
+static void fz_rate_key(const fz_cand *k, char *out, size_t cap) { snprintf(out, cap, "fz:%s", k->key); }
+
+/* Returns 1 when an action was taken (or would be, in dry-run). Every attempt
+ * is rate limited, so a freeze that keeps failing is not retried each poll. */
 static int fz_act(const fz_config *c, const fz_proc *p, const fz_cand *k) {
     char why[96], rl[64];
     snprintf(why, sizeof why, "idle %.0f min, CPU %.1f%%, uptime %.0f min",
              k->idle_min, k->cpu_pct, k->age_min);
-    snprintf(rl, sizeof rl, "fz:%s", k->key);
-    if (!rate_ok(rl, FZ_RATE_S)) return 0;
+    fz_rate_key(k, rl, sizeof rl);
+    rate_mark(rl);
 
     if (!fz_live(c)) {
         lg(LOG_NOTICE, "dry-run: would freeze %s(%d) kind=%s %ld MB | %s",
            k->label, p->pid, k->kind, p->rss_kb / 1024, why);
-        rate_mark(rl);
         return 1;
     }
 
@@ -1022,13 +1024,10 @@ static int fz_act(const fz_config *c, const fz_proc *p, const fz_cand *k) {
             return 0;
         }
         lg(LOG_WARNING, "terminated: gradle daemon(%d) rss %ld kB | %s", p->pid, p->rss_kb, why);
-        rate_mark(rl);
         return 1;
     }
 
-    if (fz_freeze(c, p, k->kind, k->label, why) != 0) return 0;
-    rate_mark(rl);
-    return 1;
+    return fz_freeze(c, p, k->kind, k->label, why) == 0;
 }
 
 static void fz_state_write(const fz_config *c, const char *buf, size_t len) {
@@ -1073,6 +1072,9 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
         fz_cand k;
         if (!fz_evaluate(c, fs, &p, now, dt, hz, up, &k)) continue;
         int act = k.forgotten && !k.optout && !acted;
+        char rl[64];
+        fz_rate_key(&k, rl, sizeof rl);
+        if (act && !rate_ok(rl, FZ_RATE_S)) act = 0;
         /* At most one check per tick keeps a slow command inside the watchdog. */
         if (act && c->active_cmd[0]) {
             if (checked) act = 0;
