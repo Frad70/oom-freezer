@@ -166,11 +166,10 @@ int main(void) {
     cand.never = 0; cand.age_min = 5;
     fz_verdict(c, &cand, verdict, sizeof verdict);
     EXPECT(!strcmp(verdict, "young"), "young processes are not frozen");
-    c->monitor = 0; c->dryrun = 1;
-    EXPECT(!fz_live(c), "dry-run never acts");
-    c->dryrun = 0;
-    EXPECT(fz_live(c), "live only with dry-run, monitor and autopilot all permitting");
-    c->dryrun = 1;
+    EXPECT(!fz_live(c), "dry-run is the default and never acts");
+    cfg_apply(c, "FREEZE_DRYRUN", "0");
+    EXPECT(fz_live(c), "FREEZE_DRYRUN=0 arms the freezer");
+    cfg_apply(c, "FREEZE_DRYRUN", "1");
 
     static fz_proc jar; const char jar_args[] = "java\0-Xmx2G\0-jar\0paper-1.21.jar\0nogui\0";
     memcpy(jar.raw, jar_args, sizeof jar_args); jar.rawlen = sizeof jar_args - 1;

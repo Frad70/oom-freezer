@@ -28,8 +28,8 @@
 
 typedef struct {
     const char *state_dir;
-    int dryrun, autopilot, interval;
-    int enable, monitor, poll_s, uptime_min, idle_min;
+    int dryrun, interval;
+    int enable, poll_s, uptime_min, idle_min;
     int cpu_idle_pct, min_rss_mb, big_java_mb, java_big, gradle;
     int reclaim_mb, reclaim_max_s;
     int active_timeout_s;
@@ -52,8 +52,8 @@ static void cfg_defaults(fz_config *c) {
     memset(c, 0, sizeof *c);
     c->state_dir = dir ? dir : "/run/oom-freezer";
     protect_parse(DEFAULT_PROTECT, &c->protect);
-    c->dryrun = 1; c->autopilot = 1; c->interval = 15;
-    c->enable = 1; c->monitor = 0; c->poll_s = 60;
+    c->dryrun = 1; c->interval = 15;
+    c->enable = 1; c->poll_s = 60;
     c->uptime_min = 60; c->idle_min = 30; c->cpu_idle_pct = 12;
     c->min_rss_mb = 128; c->big_java_mb = 1024;
     c->java_big = 0; c->gradle = 1;
@@ -77,8 +77,8 @@ static void cfg_apply(fz_config *c, const char *key, const char *val) {
     }
     #define I(name, field) if (!strcmp(key, name)) { int n; if (cfg_integer(val, &n)) c->field = n; else lg(LOG_WARNING, "config: invalid numeric value for %s, default kept", key); return; }
     #define L(name, field) if (!strcmp(key, name)) { list_parse(&c->field, val); return; }
-    I("FREEZE_DRYRUN", dryrun) I("FREEZE_AUTOPILOT", autopilot) I("FREEZE_INTERVAL_S", interval)
-    I("FREEZE_ENABLE", enable) I("FREEZE_MONITOR", monitor)
+    I("FREEZE_DRYRUN", dryrun) I("FREEZE_INTERVAL_S", interval)
+    I("FREEZE_ENABLE", enable)
     I("FREEZE_POLL_S", poll_s) I("FREEZE_MIN_UPTIME_MIN", uptime_min)
     I("FREEZE_IDLE_MIN", idle_min) I("FREEZE_CPU_IDLE_PCT", cpu_idle_pct)
     I("FREEZE_MIN_RSS_MB", min_rss_mb) I("FREEZE_BIG_JAVA_MB", big_java_mb)
@@ -90,6 +90,8 @@ static void cfg_apply(fz_config *c, const char *key, const char *val) {
     L("FREEZE_SERVER_JARS", server_jars) L("FREEZE_SERVER_MAIN", server_main)
     #undef I
     #undef L
+    /* A mistyped exemption key must not pass silently. */
+    lg(LOG_WARNING, "config: unknown key %s ignored", key);
 }
 
 static void cfg_load(fz_config *c, const char *path) {
@@ -878,7 +880,7 @@ static fz_slot *fz_slot_get(fz_state *st, const char *key) {
     return &st->slots[free_i];
 }
 
-static int fz_live(const fz_config *c) { return !c->monitor && !c->dryrun && c->autopilot; }
+static int fz_live(const fz_config *c) { return !c->dryrun; }
 
 typedef struct {
     const char *kind, *excluded, *never;
@@ -965,7 +967,7 @@ static int fz_act(const fz_config *c, const fz_proc *p, const fz_cand *k) {
     if (!rate_ok(rl, 900)) return 0;
 
     if (!fz_live(c)) {
-        lg(LOG_NOTICE, "freeze[monitor]: would freeze %s(%d) kind=%s %ld MB | %s",
+        lg(LOG_NOTICE, "dry-run: would freeze %s(%d) kind=%s %ld MB | %s",
            k->label, p->pid, k->kind, p->rss_kb / 1024, why);
         rate_mark(rl);
         return 1;
@@ -1020,7 +1022,7 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
     appendf(st, sizeof st, &stlen,
             "# oom-freezer state v1\nmode %s\nthreshold_uptime_min %d\nthreshold_idle_min %d\n"
             "threshold_cpu_pct %d\njava_big_optin %d\n",
-            fz_live(c) ? "live" : "monitor",
+            fz_live(c) ? "live" : "dry-run",
             c->uptime_min, c->idle_min, c->cpu_idle_pct, c->java_big);
     struct dirent *e;
     int acted = 0, checked = 0;
@@ -1089,8 +1091,7 @@ int main(int argc, char **argv) {
     if (once) { freeze_check(&cfg, &state); return 0; }
 
     notify_init();
-    lg(LOG_NOTICE, "started autopilot=%d dryrun=%d interval=%d s",
-       cfg.autopilot, cfg.dryrun, cfg.interval);
+    lg(LOG_NOTICE, "started dryrun=%d interval=%d s", cfg.dryrun, cfg.interval);
     notify("READY=1\nSTATUS=Watching");
 
     while (!g_stop) {
