@@ -32,6 +32,8 @@ typedef struct {
     int enable, monitor, poll_s, uptime_min, idle_min;
     int cpu_idle_pct, min_rss_mb, big_java_mb, java_big, gradle;
     int reclaim_mb, reclaim_max_s;
+    int active_timeout_s;
+    char active_cmd[PATHMAX];
     namelist watch, exclude, never, ignore, server_jars, server_main;
     protect_list protect;
 } fz_config;
@@ -57,6 +59,7 @@ static void cfg_defaults(fz_config *c) {
     c->java_big = 0; c->gradle = 1;
     c->reclaim_mb = 256; c->reclaim_max_s = 60;
     list_parse(&c->server_jars, "server");
+    c->active_timeout_s = 10;
 }
 
 static int cfg_integer(const char *value, int *out) {
@@ -67,6 +70,11 @@ static int cfg_integer(const char *value, int *out) {
 
 static void cfg_apply(fz_config *c, const char *key, const char *val) {
     if (!strcmp(key, "FREEZE_PROTECT")) { protect_parse(val, &c->protect); return; }
+    if (!strcmp(key, "FREEZE_ACTIVE_CMD")) {
+        if (!val[0] || val[0] == '/') xcpy(c->active_cmd, sizeof c->active_cmd, val);
+        else lg(LOG_WARNING, "config: %s must be an absolute path, ignored", key);
+        return;
+    }
     #define I(name, field) if (!strcmp(key, name)) { int n; if (cfg_integer(val, &n)) c->field = n; else lg(LOG_WARNING, "config: invalid numeric value for %s, default kept", key); return; }
     #define L(name, field) if (!strcmp(key, name)) { list_parse(&c->field, val); return; }
     I("FREEZE_DRYRUN", dryrun) I("FREEZE_AUTOPILOT", autopilot) I("FREEZE_INTERVAL_S", interval)
@@ -75,6 +83,7 @@ static void cfg_apply(fz_config *c, const char *key, const char *val) {
     I("FREEZE_IDLE_MIN", idle_min) I("FREEZE_CPU_IDLE_PCT", cpu_idle_pct)
     I("FREEZE_MIN_RSS_MB", min_rss_mb) I("FREEZE_BIG_JAVA_MB", big_java_mb)
     I("FREEZE_JAVA_BIG", java_big) I("FREEZE_GRADLE", gradle)
+    I("FREEZE_ACTIVE_TIMEOUT_S", active_timeout_s)
     I("FREEZE_RECLAIM_MB", reclaim_mb) I("FREEZE_RECLAIM_MAX_S", reclaim_max_s)
     L("FREEZE_WATCH", watch) L("FREEZE_EXCLUDE", exclude)
     L("FREEZE_NEVER", never) L("FREEZE_IGNORE", ignore)
@@ -875,7 +884,8 @@ typedef struct {
     const char *kind, *excluded, *never;
     char   key[FZ_KEYLEN], label[FZ_NAMELEN];
     double cpu_pct, age_min, idle_min;
-    int    sampled, idle, forgotten, optout;
+    int    sampled, idle, forgotten, optout, active;
+    fz_slot *slot;
 } fz_cand;
 
 /* Classify one process and update its CPU sample. Returns 0 when it is not a
@@ -902,6 +912,7 @@ static int fz_evaluate(const fz_config *c, fz_state *fs, const fz_proc *p,
     }
     s->ticks = p->ticks;
     s->last_seen = now;
+    k->slot = s;
 
     fz_label(c, p, k->kind, k->label, sizeof k->label);
     k->cpu_pct = s->cpu_pct;
@@ -924,9 +935,25 @@ static void fz_verdict(const fz_config *c, const fz_cand *k, char *out, size_t c
     else if (k->age_min < c->uptime_min) snprintf(out, cap, "young");
     else if (!k->sampled)             snprintf(out, cap, "no-sample");
     else if (!k->idle)                snprintf(out, cap, "busy");
+    else if (k->active)               snprintf(out, cap, "active-cmd");
     else if (!k->forgotten)           snprintf(out, cap, "idle-%.0f-of-%d-min", k->idle_min, c->idle_min);
     else if (k->optout)               snprintf(out, cap, "FORGOTTEN-opt-in-off");
     else                              snprintf(out, cap, "FORGOTTEN");
+}
+
+/* FREEZE_ACTIVE_CMD: exit 1 permits the freeze. Exit 0 means the process is
+ * in use; any other outcome (exec failure, timeout, signal) also blocks the
+ * freeze, so a broken check never freezes the service it guards. */
+static int fz_active(const fz_config *c, const fz_proc *p, const fz_cand *k) {
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", p->pid);
+    const char *argv[] = { c->active_cmd, pid, k->kind, k->label, 0 };
+    int st = run_cmd_timeout(argv, c->active_timeout_s);
+    if (st == 1) return 0;
+    if (st != 0)
+        lg(LOG_WARNING, "freeze: activity check for %s(%d) %s (status %d), not freezing",
+           k->label, p->pid, st == -2 ? "timed out" : "failed", st);
+    return 1;
 }
 
 /* Returns 1 when an action was taken (or would be, in dry-run). */
@@ -996,19 +1023,28 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
             fz_live(c) ? "live" : "monitor",
             c->uptime_min, c->idle_min, c->cpu_idle_pct, c->java_big);
     struct dirent *e;
-    int acted = 0;
+    int acted = 0, checked = 0;
     while ((e = readdir(d))) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
         int pid = atoi(e->d_name);
         if (pid <= 0 || fz_read(pid, &p) != 0) continue;
         fz_cand k;
         if (!fz_evaluate(c, fs, &p, now, dt, hz, up, &k)) continue;
+        int act = k.forgotten && !k.optout && !acted;
+        /* At most one check per tick keeps a slow command inside the watchdog. */
+        if (act && c->active_cmd[0]) {
+            if (checked) act = 0;
+            else if ((checked = 1, fz_active(c, &p, &k))) {
+                k.slot->idle_since = 0;
+                k.active = 1; k.forgotten = 0; act = 0;
+            }
+        }
         char verdict[96];
         fz_verdict(c, &k, verdict, sizeof verdict);
         appendf(st, sizeof st, &stlen,
                 "cand %d kind=%s rss_kb=%ld cpu=%.1f idle_min=%.0f age_min=%.0f verdict=%s name=%s\n",
                 pid, k.kind, p.rss_kb, k.cpu_pct, k.idle_min, k.age_min, verdict, k.label);
-        if (k.forgotten && !k.optout && !acted) acted = fz_act(c, &p, &k);
+        if (act) acted = fz_act(c, &p, &k);
     }
     closedir(d);
     for (int i = 0; i < FZ_MAXCAND; i++)

@@ -11,6 +11,8 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -277,3 +279,32 @@ int pid_protected(int pid, const protect_list *pl) {
     return 1; /* incomplete ancestry is not permission to kill */
 }
 
+
+/* Runs argv[0] (an absolute path, no shell) with stdio on /dev/null. Returns
+ * the exit status, -1 when it could not run or died by a signal, -2 on timeout.
+ * The child gets its own process group so a timeout kills its helpers too. */
+int run_cmd_timeout(const char *const argv[], int timeout_s) {
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        setpgid(0, 0);
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+        execv(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    long deadline = mono_s() + timeout_s;
+    int st = 0;
+    for (;;) {
+        pid_t r = waitpid(p, &st, WNOHANG);
+        if (r == p) break;
+        if (r < 0 && errno != EINTR) return -1;
+        if (mono_s() >= deadline) {
+            kill(-p, SIGKILL); kill(p, SIGKILL);
+            while (waitpid(p, &st, 0) < 0 && errno == EINTR) {}
+            return -2;
+        }
+        usleep(20000);
+    }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}

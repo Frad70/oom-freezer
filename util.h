@@ -23,6 +23,8 @@ long read_long_file(const char *path, long dflt);
 long field_kb(const char *buf, const char *key);
 void list_parse(namelist *l, const char *csv);
 
+int  run_cmd_timeout(const char *const argv[], int timeout_s);
+
 int  rate_ok(const char *key, int secs);
 void rate_mark(const char *key);
 

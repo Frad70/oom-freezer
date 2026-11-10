@@ -186,6 +186,34 @@ int main(void) {
     EXPECT(fz_classify(c, &jar, 512) && !strcmp(fz_classify(c, &jar, 512), "game-server"), "configured main class marks a game server");
     cfg_defaults(c);
 
+    char hooks[] = "/tmp/oom-freezer-hooks-XXXXXX", hook[PATHMAX];
+    EXPECT(mkdtemp(hooks), "hook fixture");
+    struct { const char *name, *body; int blocks; const char *what; } hk[] = {
+        {"active", "#!/bin/sh\nexit 0\n", 1, "exit 0 marks the process active"},
+        {"idle", "#!/bin/sh\n[ \"$1\" -gt 0 ] && [ \"$2\" = watched ] && exit 1\nexit 0\n", 0, "exit 1 permits the freeze and gets pid and kind"},
+        {"broken", "#!/bin/sh\nexit 3\n", 1, "an unexpected exit status blocks the freeze"},
+        {"slow", "#!/bin/sh\nexec sleep 30\n", 1, "a timeout blocks the freeze"},
+        {"missing", 0, 1, "a missing command blocks the freeze"},
+    };
+    fz_proc hp = {.pid = 4242}; fz_cand hc = {.kind = "watched", .label = "fixture"};
+    c->active_timeout_s = 1;
+    for (unsigned i = 0; i < sizeof hk / sizeof hk[0]; i++) {
+        snprintf(hook, sizeof hook, "%s/%s", hooks, hk[i].name);
+        if (hk[i].body) { registry_text(hook, hk[i].body); chmod(hook, 0700); }
+        cfg_apply(c, "FREEZE_ACTIVE_CMD", hook);
+        long t0 = mono_s();
+        EXPECT(fz_active(c, &hp, &hc) == hk[i].blocks, hk[i].what);
+        EXPECT(mono_s() - t0 <= 3, "activity check is bounded by its timeout");
+        unlink(hook);
+    }
+    rmdir(hooks);
+    cfg_apply(c, "FREEZE_ACTIVE_CMD", "relative/path");
+    EXPECT(!strcmp(c->active_cmd, hook), "a relative activity command is ignored");
+    cfg_defaults(c);
+    hc.active = 1; hc.idle = 1; hc.sampled = 1; hc.age_min = 90;
+    char verdict2[96]; fz_verdict(c, &hc, verdict2, sizeof verdict2);
+    EXPECT(!strcmp(verdict2, "active-cmd"), "active processes are reported as such");
+
     int pipes[2]; EXPECT(!pipe(pipes), "pipe"); pid_t child = fork();
     if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
     close(pipes[0]); EXPECT(child > 0, "child fixture");
