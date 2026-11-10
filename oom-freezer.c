@@ -26,16 +26,16 @@
 
 /* ================================ config ================================= */
 
-static struct {
-    int    dryrun, autopilot, interval;
-    int    fz_enable, fz_monitor, fz_poll_s, fz_uptime_min, fz_idle_min;
-    int    fz_cpu_idle_pct, fz_min_rss_mb, fz_big_java_mb, fz_java_big, fz_gradle;
-    int    fz_reclaim_mb, fz_reclaim_max_s;
-    namelist fz_watch, fz_exclude, fz_never, fz_ignore, fz_oom_protect;
-} C;
+typedef struct {
+    const char *state_dir;
+    int dryrun, autopilot, interval;
+    int enable, monitor, poll_s, uptime_min, idle_min;
+    int cpu_idle_pct, min_rss_mb, big_java_mb, java_big, gradle;
+    int reclaim_mb, reclaim_max_s;
+    namelist watch, exclude, never, ignore;
+    protect_list protect;
+} fz_config;
 
-static const char *g_conf_path = "/etc/oom-freezer/oom-freezer.conf";
-static const char *g_state_dir = "/run/oom-freezer";
 static volatile sig_atomic_t g_stop = 0, g_reload = 0;
 
 static void on_term(int s) { (void)s; g_stop = 1; }
@@ -44,17 +44,18 @@ static void on_hup(int s)  { (void)s; g_reload = 1; }
 /* ============================= config parsing ============================ */
 
 #define DEFAULT_PROTECT "systemd,init,sshd,dbus-daemon,pipewire,wireplumber,Xorg,Xwayland,gnome-shell,kwin_wayland,sway,weston"
-static protect_list g_oom_protect;
 
-static void cfg_defaults(void) {
-    protect_parse(DEFAULT_PROTECT, &g_oom_protect);
-    memset(&C, 0, sizeof C);
-    C.dryrun = 1; C.autopilot = 1; C.interval = 15;
-    C.fz_enable = 1; C.fz_monitor = 0; C.fz_poll_s = 60;
-    C.fz_uptime_min = 60; C.fz_idle_min = 30; C.fz_cpu_idle_pct = 12;
-    C.fz_min_rss_mb = 128; C.fz_big_java_mb = 1024;
-    C.fz_java_big = 0; C.fz_gradle = 1;
-    C.fz_reclaim_mb = 256; C.fz_reclaim_max_s = 60;
+static void cfg_defaults(fz_config *c) {
+    const char *dir = c->state_dir;
+    memset(c, 0, sizeof *c);
+    c->state_dir = dir ? dir : "/run/oom-freezer";
+    protect_parse(DEFAULT_PROTECT, &c->protect);
+    c->dryrun = 1; c->autopilot = 1; c->interval = 15;
+    c->enable = 1; c->monitor = 0; c->poll_s = 60;
+    c->uptime_min = 60; c->idle_min = 30; c->cpu_idle_pct = 12;
+    c->min_rss_mb = 128; c->big_java_mb = 1024;
+    c->java_big = 0; c->gradle = 1;
+    c->reclaim_mb = 256; c->reclaim_max_s = 60;
 }
 
 static int cfg_integer(const char *value, int *out) {
@@ -63,41 +64,36 @@ static int cfg_integer(const char *value, int *out) {
     *out = (int)n; return 1;
 }
 
-static void cfg_apply(const char *key, const char *val) {
-    if (!strcmp(key, "FREEZE_PROTECT")) {
-        protect_parse(val, &g_oom_protect); list_parse(&C.fz_oom_protect, val); return;
-    }
-    #define I(name, field) if (!strcmp(key, name)) { int n; if (cfg_integer(val, &n)) C.field = n; else lg(LOG_WARNING, "config: invalid numeric value for %s, default kept", key); return; }
-    #define S(name, field) if (!strcmp(key, name)) { xcpy(C.field, sizeof C.field, val); return; }
-    #define L(name, field) if (!strcmp(key, name)) { list_parse(&C.field, val); return; }
+static void cfg_apply(fz_config *c, const char *key, const char *val) {
+    if (!strcmp(key, "FREEZE_PROTECT")) { protect_parse(val, &c->protect); return; }
+    #define I(name, field) if (!strcmp(key, name)) { int n; if (cfg_integer(val, &n)) c->field = n; else lg(LOG_WARNING, "config: invalid numeric value for %s, default kept", key); return; }
+    #define L(name, field) if (!strcmp(key, name)) { list_parse(&c->field, val); return; }
     I("FREEZE_DRYRUN", dryrun) I("FREEZE_AUTOPILOT", autopilot) I("FREEZE_INTERVAL_S", interval)
-    I("FREEZE_ENABLE", fz_enable) I("FREEZE_MONITOR", fz_monitor)
-    I("FREEZE_POLL_S", fz_poll_s) I("FREEZE_MIN_UPTIME_MIN", fz_uptime_min)
-    I("FREEZE_IDLE_MIN", fz_idle_min) I("FREEZE_CPU_IDLE_PCT", fz_cpu_idle_pct)
-    I("FREEZE_MIN_RSS_MB", fz_min_rss_mb) I("FREEZE_BIG_JAVA_MB", fz_big_java_mb)
-    I("FREEZE_JAVA_BIG", fz_java_big) I("FREEZE_GRADLE", fz_gradle)
-    I("FREEZE_RECLAIM_MB", fz_reclaim_mb) I("FREEZE_RECLAIM_MAX_S", fz_reclaim_max_s)
-    L("FREEZE_WATCH", fz_watch) L("FREEZE_EXCLUDE", fz_exclude)
-    L("FREEZE_NEVER", fz_never) L("FREEZE_IGNORE", fz_ignore)
-    L("FREEZE_PROTECT", fz_oom_protect)
+    I("FREEZE_ENABLE", enable) I("FREEZE_MONITOR", monitor)
+    I("FREEZE_POLL_S", poll_s) I("FREEZE_MIN_UPTIME_MIN", uptime_min)
+    I("FREEZE_IDLE_MIN", idle_min) I("FREEZE_CPU_IDLE_PCT", cpu_idle_pct)
+    I("FREEZE_MIN_RSS_MB", min_rss_mb) I("FREEZE_BIG_JAVA_MB", big_java_mb)
+    I("FREEZE_JAVA_BIG", java_big) I("FREEZE_GRADLE", gradle)
+    I("FREEZE_RECLAIM_MB", reclaim_mb) I("FREEZE_RECLAIM_MAX_S", reclaim_max_s)
+    L("FREEZE_WATCH", watch) L("FREEZE_EXCLUDE", exclude)
+    L("FREEZE_NEVER", never) L("FREEZE_IGNORE", ignore)
     #undef I
-    #undef S
     #undef L
 }
 
-static void cfg_load(void) {
-    cfg_defaults();
+static void cfg_load(fz_config *c, const char *path) {
+    cfg_defaults(c);
     static char buf[64 * 1024];
-    if (read_file(g_conf_path, buf, sizeof buf) < 0) return;
+    if (read_file(path, buf, sizeof buf) < 0) return;
     char *line = buf;
     while (line && *line) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
         char key[64], value[1024];
-        if (config_assignment(line, key, sizeof key, value, sizeof value)) cfg_apply(key, value);
+        if (config_assignment(line, key, sizeof key, value, sizeof value)) cfg_apply(c, key, value);
         line = nl ? nl + 1 : 0;
     }
-    if (C.interval < 1) C.interval = 15;
+    if (c->interval < 1) c->interval = 15;
 }
 
 /* ============================ process helpers ============================ */
@@ -213,8 +209,10 @@ typedef struct {
     int  sampled;
 } fz_slot;
 
-static fz_slot g_fzs[FZ_MAXCAND];
-static long    g_fz_last = 0;
+typedef struct {
+    fz_slot slots[FZ_MAXCAND];
+    long    last;
+} fz_state;
 
 static int fz_write_str(const char *path, const char *val) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -302,8 +300,8 @@ static int fz_read(int pid, fz_proc *p) {
     return 0;
 }
 
-static const char *fz_classify(const fz_proc *p, long rss_mb) {
-    if (fz_list_hit(&C.fz_watch, p->hay)) return "watched";
+static const char *fz_classify(const fz_config *c, const fz_proc *p, long rss_mb) {
+    if (fz_list_hit(&c->watch, p->hay)) return "watched";
     if (strstr(p->cmd, "GradleDaemon") || strstr(p->cmd, "org.gradle.launcher.daemon"))
         return "gradle-daemon";
     if (strncmp(fz_base(p->exe[0] ? p->exe : p->raw), "java", 4)) return 0;
@@ -317,7 +315,7 @@ static const char *fz_classify(const fz_proc *p, long rss_mb) {
         } else if (fz_server_jar(fz_base(tok))) return "mc-server";
     }
     for (int i = 0; FZ_MAIN[i]; i++) if (strstr(p->cmd, FZ_MAIN[i])) return "mc-server";
-    if (rss_mb >= C.fz_big_java_mb) return "java-big";
+    if (rss_mb >= c->big_java_mb) return "java-big";
     return 0;
 }
 
@@ -342,14 +340,14 @@ static void fz_label(const fz_proc *p, const char *kind, char *out, size_t cap) 
 /* Never touched: our own tree, sacred names, the protect list, the explicit
  * never list and anything holding a /dev/dri node open (a GUI app such as a
  * game launcher with a running game is also a large java process). */
-static const char *fz_never(const fz_proc *p, const char *label) {
+static const char *fz_never(const fz_config *c, const fz_proc *p, const char *label) {
     if (p->pid <= 1 || p->pid == getpid() || fz_is_ancestor(p->pid)) return "own-tree";
     if (fz_sacred(p->comm, p->pid)) return "sacred";
-    const char *hit = fz_list_hit(&C.fz_never, p->hay);
+    const char *hit = fz_list_hit(&c->never, p->hay);
     if (hit) return hit;
-    for (int i = 0; i < C.fz_oom_protect.n; i++)
-        if (!strcmp(p->comm, C.fz_oom_protect.v[i]) || !strcmp(label, C.fz_oom_protect.v[i]))
-            return C.fz_oom_protect.v[i];
+    for (int i = 0; i < c->protect.count; i++)
+        if (!strcmp(p->comm, c->protect.names[i]) || !strcmp(label, c->protect.names[i]))
+            return c->protect.names[i];
     if (holds_gpu(p->pid)) return "gui-dri";
     return 0;
 }
@@ -484,13 +482,13 @@ static long fz_pageout(int pid) {
  * the last thaw, and its page cache). In chunks with pauses: reclaiming a
  * multi-gigabyte process in one go raises PSI to a level aegis-oom would
  * react to. */
-static long fz_reclaim(const char *cg, long *out_current) {
+static long fz_reclaim(const fz_config *c, const char *cg, long *out_current) {
     char p_cur[PATHMAX + 32], p_rec[PATHMAX + 32];
     snprintf(p_cur, sizeof p_cur, "%s/memory.current", cg);
     snprintf(p_rec, sizeof p_rec, "%s/memory.reclaim", cg);
     long start = read_long_file(p_cur, 0), cur = start;
-    long chunk = (long)C.fz_reclaim_mb * 1024 * 1024;
-    long deadline = mono_s() + C.fz_reclaim_max_s;
+    long chunk = (long)c->reclaim_mb * 1024 * 1024;
+    long deadline = mono_s() + c->reclaim_max_s;
     int stall = 0;
     while (cur > 4L * 1024 * 1024 && stall < 2 && mono_s() < deadline) {
         char v[32];
@@ -545,20 +543,20 @@ static int fz_move_back(const char *cg, const char *orig) {
     return moved;
 }
 
-static void fz_reg_path(char *out, size_t cap) { snprintf(out, cap, "%s/frozen", g_state_dir); }
+static void fz_reg_path(const fz_config *c, char *out, size_t cap) { snprintf(out, cap, "%s/frozen", c->state_dir); }
 
-static int fz_registry_lock(void) {
+static int fz_registry_lock(const fz_config *c) {
     char path[PATHMAX];
-    if (snprintf(path, sizeof path, "%s/frozen.lock", g_state_dir) >= (int)sizeof path) return -1;
+    if (snprintf(path, sizeof path, "%s/frozen.lock", c->state_dir) >= (int)sizeof path) return -1;
     int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
     if (fd >= 0) close(fd);
     return -1;
 }
 
-static int fz_reg_append(const char *line) {
-    int lock = fz_registry_lock(); if (lock < 0) return -1;
-    char reg[PATHMAX]; fz_reg_path(reg, sizeof reg);
+static int fz_reg_append(const fz_config *c, const char *line) {
+    int lock = fz_registry_lock(c); if (lock < 0) return -1;
+    char reg[PATHMAX]; fz_reg_path(c, reg, sizeof reg);
     int fd = open(reg, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0644);
     int ok = 0;
     if (fd >= 0) {
@@ -578,10 +576,10 @@ static int fz_reg_append(const char *line) {
 }
 
 /* Replace final metrics atomically; any error preserves the recovery record. */
-static int fz_reg_replace(const char *key, const char *replacement) {
-    int lock = fz_registry_lock(); if (lock < 0) return -1;
+static int fz_reg_replace(const fz_config *c, const char *key, const char *replacement) {
+    int lock = fz_registry_lock(c); if (lock < 0) return -1;
     char reg[PATHMAX], tmp[PATHMAX+32], prefix[FZ_KEYLEN+16];
-    fz_reg_path(reg, sizeof reg);
+    fz_reg_path(c, reg, sizeof reg);
     snprintf(tmp, sizeof tmp, "%s.tmp", reg);
     snprintf(prefix, sizeof prefix, "frozen %s ", key);
     static char input[64*1024], output[64*1024];
@@ -644,15 +642,15 @@ static int fz_field(const char *line, const char *key, char *out, size_t cap) {
     return 0;
 }
 
-static int fz_freeze(const fz_proc *p, const char *kind, const char *label, const char *why) {
+static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, const char *label, const char *why) {
     static fz_proc live;
-    if (fz_read(p->pid, &live) || live.start != p->start || fz_never(&live, label) || pid_protected(p->pid, &g_oom_protect)) {
+    if (fz_read(p->pid, &live) || live.start != p->start || fz_never(c, &live, label) || pid_protected(p->pid, &c->protect)) {
         lg(LOG_WARNING, "freeze cancelled: stale or protected process %d", p->pid); return -1;
     }
     int pids[FZ_MAXTREE];
     int n = fz_tree(p->pid, pids, FZ_MAXTREE);
     if (n < 1) { lg(LOG_WARNING, "freeze cancelled: incomplete process tree"); return -1; }
-    for (int i = 0; i < n; i++) if (pid_protected(pids[i], &g_oom_protect) || holds_gpu(pids[i])) {
+    for (int i = 0; i < n; i++) if (pid_protected(pids[i], &c->protect) || holds_gpu(pids[i])) {
         lg(LOG_WARNING, "freeze cancelled: protected descendant"); return -1;
     }
     char name[FZ_NAMELEN + 16], cg[PATHMAX], orig[PATHMAX];
@@ -717,7 +715,7 @@ static int fz_freeze(const fz_proc *p, const char *kind, const char *label, cons
         "frozen %s pid=%d kind=%s cg=%s orig=%s pss_before_kb=%ld pss_after_kb=-1 "
         "swap_kb=-1 ts=%ld ntasks=%d name=%s phase=reclaiming\n",
         key, p->pid, kind, name, orig[0] ? orig : "-", rss0, frozen_at, moved, safe_label);
-    if (written < 0 || written >= (int)sizeof reg || fz_reg_append(reg) != 0) {
+    if (written < 0 || written >= (int)sizeof reg || fz_reg_append(c, reg) != 0) {
         lg(LOG_ERR, "freeze: recovery registry unavailable, rolling back");
         fz_write_str(ff, "0"); fz_move_back(cg, orig); rmdir(cg); return -1;
     }
@@ -727,7 +725,7 @@ static int fz_freeze(const fz_proc *p, const char *kind, const char *label, cons
         long a = fz_pageout(pids[i]);
         if (a > 0) advised += a;
     }
-    long cur = 0, reclaimed = fz_reclaim(cg, &cur);
+    long cur = 0, reclaimed = fz_reclaim(c, cg, &cur);
 
     long rss1, swap1;
     fz_footprint(pids, n, &rss1, &swap1);
@@ -737,7 +735,7 @@ static int fz_freeze(const fz_proc *p, const char *kind, const char *label, cons
         "swap_kb=%ld ts=%ld ntasks=%d name=%s phase=frozen\n",
         key, p->pid, kind, name, orig[0] ? orig : "-", rss0, rss1,
         swap1, frozen_at, moved, safe_label);
-    if (written < 0 || written >= (int)sizeof reg || fz_reg_replace(key, reg) != 0)
+    if (written < 0 || written >= (int)sizeof reg || fz_reg_replace(c, key, reg) != 0)
         lg(LOG_ERR, "freeze: final metrics unavailable; earlier recovery record retained");
 
     lg(LOG_WARNING, "frozen: %s(%d) kind=%s PSS %ld -> %ld kB, SwapPSS %ld -> %ld kB "
@@ -746,10 +744,10 @@ static int fz_freeze(const fz_proc *p, const char *kind, const char *label, cons
     return 0;
 }
 
-static int fz_thaw(const char *spec) {
-    int lock = fz_registry_lock();
+static int fz_thaw(const fz_config *c, const char *spec) {
+    int lock = fz_registry_lock(c);
     if (lock < 0) { perror("freeze registry lock"); return -1; }
-    char reg[PATHMAX]; fz_reg_path(reg, sizeof reg);
+    char reg[PATHMAX]; fz_reg_path(c, reg, sizeof reg);
     static char buf[64*1024], keep[64*1024];
     int len = read_file(reg, buf, sizeof buf);
     if (len <= 0) {
@@ -822,7 +820,7 @@ static int fz_thaw(const char *spec) {
     return failed ? -1 : done;
 }
 
-static int fz_freeze_pid(int pid) {
+static int fz_freeze_pid(const fz_config *c, int pid) {
     static fz_proc p;
     if (fz_read(pid, &p) != 0) { printf("No such process: %d\n", pid); return 1; }
     if (p.pid <= 1 || p.pid == getpid() || fz_is_ancestor(p.pid)) {
@@ -831,29 +829,29 @@ static int fz_freeze_pid(int pid) {
     }
     if (fz_is_frozen(pid)) { printf("Already frozen: %d\n", pid); return 1; }
     char label[FZ_NAMELEN];
-    const char *kind = fz_classify(&p, p.rss_kb / 1024);
+    const char *kind = fz_classify(c, &p, p.rss_kb / 1024);
     fz_label(&p, kind ? kind : "process", label, sizeof label);
-    return fz_freeze(&p, kind ? kind : "process", label, "manual request") == 0 ? 0 : 1;
+    return fz_freeze(c, &p, kind ? kind : "process", label, "manual request") == 0 ? 0 : 1;
 }
 
-static fz_slot *fz_slot_get(const char *key) {
+static fz_slot *fz_slot_get(fz_state *st, const char *key) {
     int free_i = -1;
     for (int i = 0; i < FZ_MAXCAND; i++) {
-        if (!strcmp(g_fzs[i].key, key)) return &g_fzs[i];
-        if (free_i < 0 && !g_fzs[i].key[0]) free_i = i;
+        if (!strcmp(st->slots[i].key, key)) return &st->slots[i];
+        if (free_i < 0 && !st->slots[i].key[0]) free_i = i;
     }
     if (free_i < 0) return 0;
-    memset(&g_fzs[free_i], 0, sizeof g_fzs[free_i]);
-    xcpy(g_fzs[free_i].key, sizeof g_fzs[free_i].key, key);
-    return &g_fzs[free_i];
+    memset(&st->slots[free_i], 0, sizeof st->slots[free_i]);
+    xcpy(st->slots[free_i].key, sizeof st->slots[free_i].key, key);
+    return &st->slots[free_i];
 }
 
-static void freeze_check(void) {
-    if (!C.fz_enable) return;
+static void freeze_check(const fz_config *c, fz_state *fs) {
+    if (!c->enable) return;
     long now = mono_s();
-    if (g_fz_last && now - g_fz_last < C.fz_poll_s) return;
-    double dt = g_fz_last ? (double)(now - g_fz_last) : 0;
-    g_fz_last = now;
+    if (fs->last && now - fs->last < c->poll_s) return;
+    double dt = fs->last ? (double)(now - fs->last) : 0;
+    fs->last = now;
 
     long hz = sysconf(_SC_CLK_TCK);
     if (hz <= 0) hz = 100;
@@ -870,28 +868,28 @@ static void freeze_check(void) {
     appendf(st, sizeof st, &stlen,
             "# oom-freezer state v1\nmode %s\nthreshold_uptime_min %d\nthreshold_idle_min %d\n"
             "threshold_cpu_pct %d\njava_big_optin %d\n",
-            (C.fz_monitor || C.dryrun || !C.autopilot) ? "monitor" : "live",
-            C.fz_uptime_min, C.fz_idle_min, C.fz_cpu_idle_pct, C.fz_java_big);
+            (c->monitor || c->dryrun || !c->autopilot) ? "monitor" : "live",
+            c->uptime_min, c->idle_min, c->cpu_idle_pct, c->java_big);
     while ((e = readdir(d))) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
         int pid = atoi(e->d_name);
         if (pid <= 0 || fz_read(pid, &p) != 0) continue;
         long rss_mb = p.rss_kb / 1024;
-        if (rss_mb < C.fz_min_rss_mb) continue;
-        const char *kind = fz_classify(&p, rss_mb);
+        if (rss_mb < c->min_rss_mb) continue;
+        const char *kind = fz_classify(c, &p, rss_mb);
         if (!kind) continue;
-        if (fz_list_hit(&C.fz_ignore, p.hay)) continue;
-        if (rss_mb < (!strcmp(kind, "java-big") ? C.fz_big_java_mb : C.fz_min_rss_mb)) continue;
+        if (fz_list_hit(&c->ignore, p.hay)) continue;
+        if (rss_mb < (!strcmp(kind, "java-big") ? c->big_java_mb : c->min_rss_mb)) continue;
         if (fz_is_frozen(pid)) continue;
 
         char key[FZ_KEYLEN];
         snprintf(key, sizeof key, "%d:%llu", pid, p.start);
-        fz_slot *s = fz_slot_get(key);
+        fz_slot *s = fz_slot_get(fs, key);
         if (!s) continue;
         if (dt > 0 && s->last_seen && p.ticks >= s->ticks) {
             s->cpu_pct = (double)(p.ticks - s->ticks) * 100.0 / ((double)hz * dt);
             s->sampled = 1;
-            if (s->cpu_pct < C.fz_cpu_idle_pct) { if (!s->idle_since) s->idle_since = now; }
+            if (s->cpu_pct < c->cpu_idle_pct) { if (!s->idle_since) s->idle_since = now; }
             else s->idle_since = 0;
         }
         s->ticks = p.ticks;
@@ -906,19 +904,19 @@ static void freeze_check(void) {
                  idle_min, s->cpu_pct, age_min);
         snprintf(rl, sizeof rl, "fz:%s", key);
 
-        const char *excl = fz_list_hit(&C.fz_exclude, p.hay);
-        const char *never = excl ? 0 : fz_never(&p, label);
-        int forgotten = !excl && !never && age_min >= C.fz_uptime_min &&
-                        s->idle_since && idle_min >= C.fz_idle_min;
-        int optout = forgotten && ((!strcmp(kind, "java-big") && !C.fz_java_big) ||
-                                   (!strcmp(kind, "gradle-daemon") && !C.fz_gradle));
+        const char *excl = fz_list_hit(&c->exclude, p.hay);
+        const char *never = excl ? 0 : fz_never(c, &p, label);
+        int forgotten = !excl && !never && age_min >= c->uptime_min &&
+                        s->idle_since && idle_min >= c->idle_min;
+        int optout = forgotten && ((!strcmp(kind, "java-big") && !c->java_big) ||
+                                   (!strcmp(kind, "gradle-daemon") && !c->gradle));
 
         if (excl)                          snprintf(verdict, sizeof verdict, "excluded:%s", excl);
         else if (never)                    snprintf(verdict, sizeof verdict, "never:%s", never);
-        else if (age_min < C.fz_uptime_min) snprintf(verdict, sizeof verdict, "young");
+        else if (age_min < c->uptime_min) snprintf(verdict, sizeof verdict, "young");
         else if (!s->sampled)              snprintf(verdict, sizeof verdict, "no-sample");
         else if (!s->idle_since)           snprintf(verdict, sizeof verdict, "busy");
-        else if (!forgotten)               snprintf(verdict, sizeof verdict, "idle-%.0f-of-%d-min", idle_min, C.fz_idle_min);
+        else if (!forgotten)               snprintf(verdict, sizeof verdict, "idle-%.0f-of-%d-min", idle_min, c->idle_min);
         else if (optout)                   snprintf(verdict, sizeof verdict, "FORGOTTEN-opt-in-off");
         else                               snprintf(verdict, sizeof verdict, "FORGOTTEN");
 
@@ -929,7 +927,7 @@ static void freeze_check(void) {
         if (!forgotten || optout || acted) continue;
         if (!rate_ok(rl, 900)) continue;
 
-        if (C.fz_monitor || C.dryrun || !C.autopilot) {
+        if (c->monitor || c->dryrun || !c->autopilot) {
             lg(LOG_NOTICE, "freeze[monitor]: would freeze %s(%d) kind=%s %ld MB | %s",
                label, pid, kind, rss_mb, why);
             rate_mark(rl);
@@ -951,14 +949,14 @@ static void freeze_check(void) {
             continue;
         }
 
-        if (fz_freeze(&p, kind, label, why) == 0) { rate_mark(rl); acted = 1; }
+        if (fz_freeze(c, &p, kind, label, why) == 0) { rate_mark(rl); acted = 1; }
     }
     closedir(d);
     for (int i = 0; i < FZ_MAXCAND; i++)
-        if (g_fzs[i].key[0] && g_fzs[i].last_seen != now) g_fzs[i].key[0] = 0;
+        if (fs->slots[i].key[0] && fs->slots[i].last_seen != now) fs->slots[i].key[0] = 0;
 
     char sp[PATHMAX], tmp[PATHMAX + 32];
-    snprintf(sp, sizeof sp, "%s/freeze.state", g_state_dir);
+    snprintf(sp, sizeof sp, "%s/freeze.state", c->state_dir);
     snprintf(tmp, sizeof tmp, "%s.tmp", sp);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd >= 0) {
@@ -972,16 +970,19 @@ static void freeze_check(void) {
 /* ================================= main ================================== */
 
 int main(int argc, char **argv) {
+    static fz_config cfg;
+    static fz_state state;
+    const char *conf_path = "/etc/oom-freezer/oom-freezer.conf";
     const char *conf = getenv("OOM_FREEZER_CONF");
-    if (conf && *conf) g_conf_path = conf;
+    if (conf && *conf) conf_path = conf;
     const char *sd = getenv("OOM_FREEZER_STATE");
-    if (sd && *sd) g_state_dir = sd;
+    if (sd && *sd) cfg.state_dir = sd;
     int once = 0;
     const char *thaw = 0;
     int freeze_pid = 0, manual = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--once")) once = 1;
-        else if (!strcmp(argv[i], "--conf") && i + 1 < argc) g_conf_path = argv[++i];
+        else if (!strcmp(argv[i], "--conf") && i + 1 < argc) conf_path = argv[++i];
         else if (!strcmp(argv[i], "--thaw") && i + 1 < argc) thaw = argv[++i];
         else if (!strcmp(argv[i], "--freeze") && i + 1 < argc) { freeze_pid = atoi(argv[++i]); manual = 1; }
         /* An argument without a value used to fall through every branch, and a
@@ -990,33 +991,33 @@ int main(int argc, char **argv) {
     }
 
     openlog("oom-freezer", LOG_PID, LOG_DAEMON);
-    cfg_load();
-    mkdir(g_state_dir, 0755);
+    cfg_load(&cfg, conf_path);
+    mkdir(cfg.state_dir, 0755);
 
     signal(SIGTERM, on_term);
     signal(SIGINT, on_term);
     signal(SIGHUP, on_hup);
     signal(SIGPIPE, SIG_IGN);
 
+    if (thaw) return fz_thaw(&cfg, thaw) >= 0 ? 0 : 1;
+    if (manual) return fz_freeze_pid(&cfg, freeze_pid);
+    if (once) { freeze_check(&cfg, &state); return 0; }
+
     notify_init();
     lg(LOG_NOTICE, "started autopilot=%d dryrun=%d interval=%d s",
-       C.autopilot, C.dryrun, C.interval);
+       cfg.autopilot, cfg.dryrun, cfg.interval);
     notify("READY=1\nSTATUS=Watching");
-
-    if (thaw) return fz_thaw(thaw) >= 0 ? 0 : 1;
-    if (manual) return fz_freeze_pid(freeze_pid);
-    if (once) { freeze_check(); return 0; }
 
     while (!g_stop) {
         if (g_reload) {
             g_reload = 0;
-            cfg_load();
+            cfg_load(&cfg, conf_path);
             lg(LOG_INFO, "config reloaded on SIGHUP");
         }
-        freeze_check();
+        freeze_check(&cfg, &state);
         notify("WATCHDOG=1");
 
-        for (int i = 0; i < C.interval && !g_stop && !g_reload; i++) sleep(1);
+        for (int i = 0; i < cfg.interval && !g_stop && !g_reload; i++) sleep(1);
     }
 
     lg(LOG_NOTICE, "stopped cleanly");

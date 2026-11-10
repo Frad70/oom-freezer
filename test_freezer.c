@@ -14,15 +14,16 @@ static void registry_text(const char *path, const char *value) {
 }
 
 int main(void) {
-    cfg_defaults();
-    EXPECT(C.dryrun == 1, "missing config starts main daemon in dry-run");
-    cfg_apply("FREEZE_INTERVAL_S", "garbage");
-    EXPECT(C.interval == 15, "malformed numeric value cannot create a busy loop");
-    cfg_apply("FREEZE_DRYRUN", "false");
-    EXPECT(C.dryrun == 1, "malformed dryrun cannot arm the daemon");
-    cfg_apply("FREEZE_PROTECT", "java,firefox");
-    EXPECT(protect_has("java", &g_oom_protect) && C.fz_oom_protect.n == 2,
-           "OOM and freezer share the configured protection list");
+    static fz_config cfg; fz_config *c = &cfg;
+    cfg_defaults(c);
+    EXPECT(c->dryrun == 1, "missing config starts main daemon in dry-run");
+    cfg_apply(c, "FREEZE_INTERVAL_S", "garbage");
+    EXPECT(c->interval == 15, "malformed numeric value cannot create a busy loop");
+    cfg_apply(c, "FREEZE_DRYRUN", "false");
+    EXPECT(c->dryrun == 1, "malformed dryrun cannot arm the daemon");
+    cfg_apply(c, "FREEZE_PROTECT", "java,firefox");
+    EXPECT(protect_has("java", &c->protect) && c->protect.count == 2,
+           "configured protect list replaces the default");
     EXPECT(fz_valid_component("paper-123-456"), "safe freezer name");
     EXPECT(!fz_valid_component("../escape"), "freezer traversal rejected");
     EXPECT(!fz_valid_component("name\nfrozen"), "registry newline rejected");
@@ -51,35 +52,35 @@ int main(void) {
     } else close(pipes[1]);
 
     char state[] = "/tmp/oom-freezer-registry-XXXXXX";
-    EXPECT(mkdtemp(state), "registry fixture"); g_state_dir = state;
+    EXPECT(mkdtemp(state), "registry fixture"); c->state_dir = state;
     char path[PATHMAX], actual[2048]; snprintf(path, sizeof path, "%s/frozen", state);
     registry_text(path, "frozen 1:2 pid=123 phase=reclaiming\nfrozen 3:4 pid=456 phase=reclaiming\n");
-    EXPECT(!fz_reg_replace("1:2", "frozen 1:2 pid=123 phase=frozen\n"), "final metrics replace exactly one record");
+    EXPECT(!fz_reg_replace(c, "1:2", "frozen 1:2 pid=123 phase=frozen\n"), "final metrics replace exactly one record");
     EXPECT(read_file(path, actual, sizeof actual) >= 0 &&
            !strcmp(actual, "frozen 1:2 pid=123 phase=frozen\nfrozen 3:4 pid=456 phase=reclaiming\n"),
            "metric update preserves unrelated recovery records");
-    EXPECT(fz_reg_replace("9:9", "unexpected\n") < 0, "missing recovery identity is never inserted");
+    EXPECT(fz_reg_replace(c, "9:9", "unexpected\n") < 0, "missing recovery identity is never inserted");
     const char *malicious = "frozen 1:2 pid=123 cg=../../escape orig=/user.slice name=fixture\n";
     registry_text(path, malicious);
-    EXPECT(fz_thaw("all") < 0, "invalid registry entry cannot trigger a thaw");
+    EXPECT(fz_thaw(c, "all") < 0, "invalid registry entry cannot trigger a thaw");
     EXPECT(read_file(path, actual, sizeof actual) >= 0 && !strcmp(actual, malicious), "invalid recovery entry retained");
     const char *pending = "frozen 1:2 pid=123 cg=fixture-123-456 orig=/user.slice name=fixture\n";
     registry_text(path, pending);
-    EXPECT(fz_thaw("all") < 0, "failed thaw is reported");
+    EXPECT(fz_thaw(c, "all") < 0, "failed thaw is reported");
     EXPECT(read_file(path, actual, sizeof actual) >= 0 && !strcmp(actual, pending), "failed thaw retains recovery entry");
     registry_text(path, "incomplete record");
-    EXPECT(fz_thaw("all") < 0, "incomplete registry is never rewritten");
+    EXPECT(fz_thaw(c, "all") < 0, "incomplete registry is never rewritten");
     EXPECT(read_file(path, actual, sizeof actual) >= 0 && !strcmp(actual, "incomplete record"), "partial registry preserved");
-    EXPECT(fz_reg_append("frozen 1:2\n") < 0, "append never extends an incomplete recovery registry");
+    EXPECT(fz_reg_append(c, "frozen 1:2\n") < 0, "append never extends an incomplete recovery registry");
     static char full_registry[64*1024];
     memset(full_registry, 'x', sizeof full_registry-2);
     full_registry[sizeof full_registry-2] = '\n';
     full_registry[sizeof full_registry-1] = 0;
     registry_text(path, full_registry);
-    EXPECT(fz_reg_append("frozen 1:2\n") < 0, "writer cannot grow beyond the recovery reader limit");
+    EXPECT(fz_reg_append(c, "frozen 1:2\n") < 0, "writer cannot grow beyond the recovery reader limit");
     unlink(path);
     EXPECT(!symlink("/dev/full", path), "symlink fixture");
-    EXPECT(fz_reg_append("frozen 1:2\n") < 0, "registry writer refuses symlinks");
+    EXPECT(fz_reg_append(c, "frozen 1:2\n") < 0, "registry writer refuses symlinks");
     unlink(path);
     char root[] = "/tmp/oom-freezer-thaw-XXXXXX", leaf[PATHMAX], control[PATHMAX+32];
     EXPECT(mkdtemp(root), "fake cgroup filesystem"); test_freezer_root = root;
@@ -89,14 +90,14 @@ int main(void) {
     snprintf(control, sizeof control, "%s/cgroup.events", leaf); registry_text(control, "populated 1\nfrozen 0\n");
     const char *unrestored = "frozen 123:456 pid=123 cg=fixture-123-456 orig=- name=fixture\n";
     registry_text(path, unrestored);
-    EXPECT(fz_thaw("all") < 0, "thaw cannot report full recovery while the cgroup cannot be removed");
+    EXPECT(fz_thaw(c, "all") < 0, "thaw cannot report full recovery while the cgroup cannot be removed");
     EXPECT(read_file(path, actual, sizeof actual) >= 0 && !strcmp(actual, unrestored),
            "failed cgroup removal must retain recovery");
     /* A previous attempt may remove the leaf but fail to commit the registry.
      * A retry must be able to finish that bookkeeping, without acting on a PID. */
     unlink(control); snprintf(control, sizeof control, "%s/cgroup.freeze", leaf); unlink(control); rmdir(leaf);
     registry_text(path, unrestored);
-    EXPECT(fz_thaw("all") == 1, "retry finishes recovery for a confirmed absent leaf");
+    EXPECT(fz_thaw(c, "all") == 1, "retry finishes recovery for a confirmed absent leaf");
     EXPECT(read_file(path, actual, sizeof actual) == 0, "completed recovery is removed on retry");
     rmdir(root);
     unlink(path); snprintf(path, sizeof path, "%s/frozen.lock", state); unlink(path); rmdir(state);
