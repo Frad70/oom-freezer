@@ -80,7 +80,7 @@ FILE *fopen(const char *path, const char *mode) {
             code = r'''
 import sys, resource, ctypes
 resource.setrlimit(resource.RLIMIT_AS, (128*1024*1024, 128*1024*1024))
-ctypes.CDLL(None).prctl(15, b'fz-fixture', 0, 0, 0)
+ctypes.CDLL(None).prctl(15, b'freezer-fixture', 0, 0, 0)
 data = bytearray(32*1024*1024)
 for i in range(0, len(data), 4096): data[i] = 1
 print('READY', flush=True)
@@ -111,7 +111,7 @@ for line in sys.stdin: print(sum(data[::4096]), flush=True)
             assert values['pid'] == str(child.pid) and values['orig'] == str(cg / 'origin.scope').removeprefix('/sys/fs/cgroup')
             assert 'cmd=' not in record
             assert values['phase'] == 'frozen'
-            assert values['name'] == 'fz-fixture'
+            assert values['name'] == 'freezer-fixture'
             print('PASS: owned fixture frozen; recovery registry saved; original cgroup retained', flush=True)
             print(record, end='', flush=True)
             # The original leaf can disappear while the application is frozen.
