@@ -82,19 +82,21 @@ long field_kb(const char *buf, const char *key) {
 }
 
 
-void list_parse(namelist *l, const char *csv) {
+int list_parse(namelist *l, const char *csv) {
     l->n = 0;
+    int dropped = 0;
     const char *p = csv;
-    while (*p && l->n < MAXLIST) {
+    while (*p) {
         while (*p == ' ' || *p == ',') p++;
         if (!*p) break;
         const char *e = p;
         while (*e && *e != ',' && *e != ' ') e++;
         size_t len = (size_t)(e - p);
-        if (len >= MAXNAME) len = MAXNAME - 1;
-        if (len) { memcpy(l->v[l->n], p, len); l->v[l->n][len] = 0; l->n++; }
+        if (len >= MAXNAME || l->n == MAXLIST) dropped++;
+        else { memcpy(l->v[l->n], p, len); l->v[l->n][len] = 0; l->n++; }
         p = e;
     }
+    return dropped;
 }
 
 /* =========================== systemd watchdog ============================ */
@@ -307,4 +309,17 @@ int run_cmd_timeout(const char *const argv[], int timeout_s) {
         usleep(20000);
     }
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Strict decimal pid: digits only, no sign, no trailing text, 1..INT_MAX. */
+int parse_pid(const char *s, int *out) {
+    if (!s || *s < '1' || *s > '9') return 0;
+    long v = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return 0;
+        v = v * 10 + (*s - '0');
+        if (v > INT_MAX) return 0;
+    }
+    *out = (int)v;
+    return 1;
 }

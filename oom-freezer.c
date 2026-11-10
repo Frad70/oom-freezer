@@ -76,7 +76,7 @@ static void cfg_apply(fz_config *c, const char *key, const char *val) {
         return;
     }
     #define I(name, field) if (!strcmp(key, name)) { int n; if (cfg_integer(val, &n)) c->field = n; else lg(LOG_WARNING, "config: invalid numeric value for %s, default kept", key); return; }
-    #define L(name, field) if (!strcmp(key, name)) { list_parse(&c->field, val); return; }
+    #define L(name, field) if (!strcmp(key, name)) { if (list_parse(&c->field, val)) lg(LOG_WARNING, "config: %s keeps %d entries of at most %d bytes, the rest is ignored", key, MAXLIST, MAXNAME - 1); return; }
     I("FREEZE_DRYRUN", dryrun) I("FREEZE_INTERVAL_S", interval)
     I("FREEZE_ENABLE", enable)
     I("FREEZE_POLL_S", poll_s) I("FREEZE_MIN_UPTIME_MIN", uptime_min)
@@ -113,9 +113,10 @@ static void cfg_load(fz_config *c, const char *path) {
 
 /* Our own process tree: whoever started us and its ancestors. Freezing them
  * would freeze the shell or service manager that has to undo it. */
+#define FZ_ANCESTOR_HOPS 24
 static int fz_is_ancestor(int pid) {
     int cur = (int)getppid();
-    for (int hop = 0; hop < 24 && cur > 1; hop++) {
+    for (int hop = 0; hop < FZ_ANCESTOR_HOPS && cur > 1; hop++) {
         if (cur == pid) return 1;
         char p[64], b[512];
         snprintf(p, sizeof p, "/proc/%d/stat", cur);
@@ -180,8 +181,15 @@ static int holds_gpu(int pid) {
 #ifndef FZ_ROOT
 #define FZ_ROOT     "/sys/fs/cgroup/oom-freezer"
 #endif
-#define FZ_MAXCAND  64
-#define FZ_MAXTREE  256
+#define FZ_MAXCAND  64              /* candidates tracked between polls */
+#define FZ_RATE_S   900             /* one action per process per 15 minutes */
+#define FZ_REG_MAX  (64 * 1024)     /* registry size every reader accepts */
+#define FZ_IOV_MAX  256             /* ranges per process_madvise call */
+#define FZ_RECLAIM_FLOOR   (4L * 1024 * 1024)  /* stop reclaim below this */
+#define FZ_RECLAIM_STALL   (1L * 1024 * 1024)  /* progress smaller than this is a stall */
+#define FZ_RECLAIM_PAUSE_US 100000
+#define FZ_POLL_STEP_MS    50
+#define FZ_MAXTREE  256             /* processes in one frozen tree */
 #define FZ_KEYLEN   40
 #define FZ_NAMELEN  64
 #define FZ_CMDLEN   16384
@@ -277,7 +285,7 @@ static int fz_read(int pid, fz_proc *p) {
     unsigned long long ut = 0, st = 0;
     long rss_pages = 0;
     for (int f = 3; *q && f <= 24; f++) {
-        if (f == 4)  p->ppid = atoi(q);
+        if (f == 4)  p->ppid = (int)strtol(q, 0, 10);
         if (f == 14) ut = strtoull(q, 0, 10);
         if (f == 15) st = strtoull(q, 0, 10);
         if (f == 22) p->start = strtoull(q, 0, 10);
@@ -397,7 +405,7 @@ static int fz_is_frozen(int pid) {
     if (!fz_in_root(cg)) return 0;
     snprintf(p, sizeof p, "%s%s/cgroup.freeze", FZ_MNT, cg);
     if (read_file(p, b, sizeof b) < 0) return 0;
-    return atoi(b) == 1;
+    return b[0] == '1' && (b[1] == '\n' || !b[1]);
 }
 
 static int fz_tree(int root, int *pids, int cap) {
@@ -408,7 +416,7 @@ static int fz_tree(int root, int *pids, int cap) {
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-        int pid = atoi(e->d_name); if (pid <= 0) continue;
+        int pid; if (!parse_pid(e->d_name, &pid)) continue;
         if (ln == MAXPROC) { closedir(d); errno = EOVERFLOW; return -1; }
         char path[64], buf[1024]; snprintf(path, sizeof path, "/proc/%d/stat", pid);
         if (read_file(path, buf, sizeof buf) < 0) continue;
@@ -460,7 +468,7 @@ static long fz_pageout(int pid) {
     FILE *f = fopen(path, "re");
     if (!f) { close(pidfd); return -1; }
 
-    struct iovec iov[256];
+    struct iovec iov[FZ_IOV_MAX];
     int nv = 0;
     long done = 0;
     char line[512];
@@ -475,7 +483,7 @@ static long fz_pageout(int pid) {
         if (b <= a) continue;
         iov[nv].iov_base = (void *)a;
         iov[nv].iov_len  = b - a;
-        if (++nv == 256) {
+        if (++nv == FZ_IOV_MAX) {
             long r = syscall(__NR_process_madvise, pidfd, iov, (size_t)nv, MADV_PAGEOUT, 0U);
             if (r > 0) done += r;
             nv = 0;
@@ -502,14 +510,14 @@ static long fz_reclaim(const fz_config *c, const char *cg, long *out_current) {
     long chunk = (long)c->reclaim_mb * 1024 * 1024;
     long deadline = mono_s() + c->reclaim_max_s;
     int stall = 0;
-    while (cur > 4L * 1024 * 1024 && stall < 2 && mono_s() < deadline) {
+    while (cur > FZ_RECLAIM_FLOOR && stall < 2 && mono_s() < deadline) {
         char v[32];
         snprintf(v, sizeof v, "%ld", cur < chunk ? cur : chunk);
         fz_write(p_rec, v);
         long now = read_long_file(p_cur, cur);
-        if (cur - now < 1L * 1024 * 1024) stall++; else stall = 0;
+        if (cur - now < FZ_RECLAIM_STALL) stall++; else stall = 0;
         cur = now;
-        usleep(100000);
+        usleep(FZ_RECLAIM_PAUSE_US);
     }
     *out_current = cur;
     return start - cur;
@@ -518,12 +526,12 @@ static long fz_reclaim(const fz_config *c, const char *cg, long *out_current) {
 static int fz_wait_frozen(const char *cg, int want, int max_ms) {
     char p[PATHMAX + 32], buf[256];
     snprintf(p, sizeof p, "%s/cgroup.events", cg);
-    for (int i = 0; i < max_ms / 50; i++) {
+    for (int i = 0; i < max_ms / FZ_POLL_STEP_MS; i++) {
         if (read_file(p, buf, sizeof buf) >= 0) {
             const char *f = strstr(buf, "frozen ");
-            if (f && atoi(f + 7) == want) return 0;
+            if (f && f[7] == '0' + want && (f[8] == '\n' || !f[8])) return 0;
         }
-        usleep(50000);
+        usleep(FZ_POLL_STEP_MS * 1000);
     }
     return -1;
 }
@@ -540,18 +548,14 @@ static int fz_move_back(const char *cg, const char *orig) {
     if (length < 0 && errno == ENOENT) return 0;
     if (length < 0 || length == (int)sizeof buf - 1) return -1;
     int moved = 0;
-    char *p = buf;
-    while (*p) {
-        int pid = atoi(p);
-        if (pid > 0) {
-            char v[16];
-            snprintf(v, sizeof v, "%d", pid);
-            if (fz_write(dst, v) == 0) moved++;
-            else if (errno != ESRCH) return -1;
-        }
-        char *nl = strchr(p, '\n');
+    for (char *p = buf, *nl; *p; p = nl + 1) {
+        nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        int pid;
+        if (!parse_pid(p, &pid)) return -1;
+        if (fz_write(dst, p) == 0) moved++;
+        else if (errno != ESRCH) return -1;
         if (!nl) break;
-        p = nl + 1;
     }
     return moved;
 }
@@ -579,8 +583,8 @@ static int fz_reg_append(const fz_config *c, const char *line) {
         int complete = before == 0 || (before > 0 && pread(fd, &last, 1, before-1) == 1 && last == '\n');
         /* Readers reject a full/truncated 64 KiB buffer. Never create a
          * recovery file they cannot consume, or extend a partial record. */
-        ok = before >= 0 && complete && length < 64*1024-1 &&
-             before < (off_t)(64*1024-1-length) && write(fd, line, length) == (ssize_t)length;
+        ok = before >= 0 && complete && length < FZ_REG_MAX-1 &&
+             before < (off_t)(FZ_REG_MAX-1-length) && write(fd, line, length) == (ssize_t)length;
         if (!ok && before >= 0) (void)ftruncate(fd, before);
         close(fd);
     }
@@ -595,7 +599,7 @@ static int fz_reg_replace(const fz_config *c, const char *key, const char *repla
     fz_reg_path(c, reg, sizeof reg);
     snprintf(tmp, sizeof tmp, "%s.tmp", reg);
     snprintf(prefix, sizeof prefix, "frozen %s ", key);
-    static char input[64*1024], output[64*1024];
+    static char input[FZ_REG_MAX], output[FZ_REG_MAX];
     int n = read_file_whole(reg, input, sizeof input), matches = 0, ok = 0;
     size_t used = 0;
     if (n <= 0 || input[n-1] != '\n') goto out;
@@ -782,7 +786,7 @@ static int fz_thaw(const fz_config *c, const char *spec) {
     int lock = fz_registry_lock(c);
     if (lock < 0) { perror("freeze registry lock"); return -1; }
     char reg[PATHMAX]; fz_reg_path(c, reg, sizeof reg);
-    static char buf[64*1024], keep[64*1024];
+    static char buf[FZ_REG_MAX], keep[FZ_REG_MAX];
     int len = read_file(reg, buf, sizeof buf);
     if (len <= 0) {
         int missing = errno == ENOENT || len == 0; close(lock);
@@ -964,7 +968,7 @@ static int fz_act(const fz_config *c, const fz_proc *p, const fz_cand *k) {
     snprintf(why, sizeof why, "idle %.0f min, CPU %.1f%%, uptime %.0f min",
              k->idle_min, k->cpu_pct, k->age_min);
     snprintf(rl, sizeof rl, "fz:%s", k->key);
-    if (!rate_ok(rl, 900)) return 0;
+    if (!rate_ok(rl, FZ_RATE_S)) return 0;
 
     if (!fz_live(c)) {
         lg(LOG_NOTICE, "dry-run: would freeze %s(%d) kind=%s %ld MB | %s",
@@ -1028,8 +1032,8 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
     int acted = 0, checked = 0;
     while ((e = readdir(d))) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
-        int pid = atoi(e->d_name);
-        if (pid <= 0 || fz_read(pid, &p) != 0) continue;
+        int pid;
+        if (!parse_pid(e->d_name, &pid) || fz_read(pid, &p) != 0) continue;
         fz_cand k;
         if (!fz_evaluate(c, fs, &p, now, dt, hz, up, &k)) continue;
         int act = k.forgotten && !k.optout && !acted;
@@ -1071,7 +1075,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "--conf") && i + 1 < argc) conf_path = argv[++i];
         else if (!strcmp(argv[i], "--thaw") && i + 1 < argc) thaw = argv[++i];
-        else if (!strcmp(argv[i], "--freeze") && i + 1 < argc) { freeze_pid = atoi(argv[++i]); manual = 1; }
+        else if (!strcmp(argv[i], "--freeze") && i + 1 < argc) {
+            if (!parse_pid(argv[++i], &freeze_pid)) { fprintf(stderr, "oom-freezer: invalid pid \"%s\"\n", argv[i]); return 2; }
+            manual = 1;
+        }
         /* An argument without a value used to fall through every branch, and a
          * one-shot command silently became a second daemon. Unknown is an error. */
         else { fprintf(stderr, "oom-freezer: unknown argument \"%s\"\n", argv[i]); return 2; }

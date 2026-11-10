@@ -150,6 +150,17 @@ int main(void) {
     fz_label(c, &label_source, "watched", safe_label, sizeof safe_label);
     EXPECT(!strcmp(safe_label, "python3"), "generic process label must not copy an arbitrary command argument");
 
+    int pid = 0;
+    EXPECT(parse_pid("4242", &pid) && pid == 4242, "plain pid parses");
+    EXPECT(!parse_pid("0", &pid) && !parse_pid("-5", &pid) && !parse_pid("12x", &pid) &&
+           !parse_pid("99999999999", &pid) && !parse_pid("", &pid) && !parse_pid(" 7", &pid),
+           "zero, signs, trailing text, overflow and blanks are rejected");
+    namelist many;
+    EXPECT(list_parse(&many, "a,b,c") == 0 && many.n == 3, "short list parses completely");
+    char longlist[2048] = ""; size_t ll = 0;
+    for (int i = 0; i < MAXLIST + 3; i++) appendf(longlist, sizeof longlist, &ll, "n%d,", i);
+    appendf(longlist, sizeof longlist, &ll, "%s", "this-entry-is-far-longer-than-the-name-limit");
+    EXPECT(list_parse(&many, longlist) == 4 && many.n == MAXLIST, "overflowing list reports dropped entries");
     fz_cand cand = {.kind = "watched", .age_min = 90, .sampled = 1, .idle = 1, .idle_min = 10};
     char verdict[96];
     fz_verdict(c, &cand, verdict, sizeof verdict);

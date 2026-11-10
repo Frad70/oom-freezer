@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 #define MAXNAME     32
-#define MAXLIST     16
+#define MAXLIST     32
 #define MAXPROTECT  32
 #define PATHMAX     512
 #define OOM_ADJ_IMMUNE (-1000)
@@ -21,7 +21,8 @@ int  read_file(const char *path, char *buf, size_t cap);
 int  read_file_whole(const char *path, char *buf, size_t size);
 long read_long_file(const char *path, long dflt);
 long field_kb(const char *buf, const char *key);
-void list_parse(namelist *l, const char *csv);
+int  list_parse(namelist *l, const char *csv);   /* returns entries dropped */
+int  parse_pid(const char *s, int *out);
 
 int  run_cmd_timeout(const char *const argv[], int timeout_s);
 
