@@ -1,0 +1,20 @@
+[Unit]
+Description=Freezer for idle, memory-heavy background processes
+After=multi-user.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=@PREFIX@/bin/oom-freezer
+ExecReload=/bin/kill -HUP $MAINPID
+Environment=OOM_FREEZER_CONF=/etc/oom-freezer/oom-freezer.conf
+# the daemon runs under the systemd watchdog: no ping for >120 s -> restart
+WatchdogSec=120
+Restart=always
+RestartSec=5
+# must survive resource shortage itself
+OOMScoreAdjust=-700
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

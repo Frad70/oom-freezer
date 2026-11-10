@@ -1,0 +1,4 @@
+/oom-freezer
+/test-freezer
+*.o
+__pycache__/
