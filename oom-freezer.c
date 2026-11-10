@@ -194,11 +194,21 @@ static int holds_gpu(int pid) {
 #define FZ_NAMELEN  64
 #define FZ_CMDLEN   16384
 
-#ifndef __NR_pidfd_open
-#define __NR_pidfd_open 434
-#endif
-#ifndef __NR_process_madvise
-#define __NR_process_madvise 440
+/* Old libc headers may lack these. 434 and 440 are the numbers of the unified
+ * syscall table shared by the architectures listed; others (alpha, mips, x32)
+ * use offsets, so they must come from the headers. */
+#if !defined(SYS_pidfd_open) || !defined(SYS_process_madvise)
+# if (defined(__x86_64__) && !defined(__ILP32__)) || defined(__i386__) || defined(__aarch64__) || \
+     defined(__arm__) || defined(__riscv) || defined(__powerpc__) || defined(__s390__) || defined(__loongarch__)
+#  ifndef SYS_pidfd_open
+#   define SYS_pidfd_open 434
+#  endif
+#  ifndef SYS_process_madvise
+#   define SYS_process_madvise 440
+#  endif
+# else
+#  error "unknown architecture: use kernel headers that define SYS_pidfd_open and SYS_process_madvise"
+# endif
 #endif
 #ifndef MADV_PAGEOUT
 #define MADV_PAGEOUT 21
@@ -460,9 +470,27 @@ static void fz_footprint(const int *pids, int n, long *rss_kb, long *swap_kb) {
 /* Push a process's pages to swap. This is what frees RAM: the kernel decides
  * where the pages go (zram before disk); what matters is that they leave the
  * resident set of the frozen process. */
+static int sys_pidfd_open(int pid) { return (int)syscall(SYS_pidfd_open, pid, 0); }
+static long sys_process_madvise(int pidfd, const struct iovec *iov, size_t n) {
+    return syscall(SYS_process_madvise, pidfd, iov, n, MADV_PAGEOUT, 0U);
+}
+static int (*fz_pidfd_open)(int) = sys_pidfd_open;
+static long (*fz_madvise)(int, const struct iovec *, size_t) = sys_process_madvise;
+static int fz_no_pageout;
+
+/* Kernels before 5.10 lack process_madvise: freeze without pageout and say so
+ * once; memory.reclaim still runs where the kernel has it. */
+static int fz_nosys(const char *what) {
+    if (errno != ENOSYS) return 0;
+    if (!fz_no_pageout) lg(LOG_WARNING, "freeze: %s is not supported by this kernel, pageout disabled", what);
+    fz_no_pageout = 1;
+    return 1;
+}
+
 static long fz_pageout(int pid) {
-    int pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
-    if (pidfd < 0) return -1;
+    if (fz_no_pageout) return -1;
+    int pidfd = fz_pidfd_open(pid);
+    if (pidfd < 0) { fz_nosys("pidfd_open"); return -1; }
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/maps", pid);
     FILE *f = fopen(path, "re");
@@ -484,14 +512,16 @@ static long fz_pageout(int pid) {
         iov[nv].iov_base = (void *)a;
         iov[nv].iov_len  = b - a;
         if (++nv == FZ_IOV_MAX) {
-            long r = syscall(__NR_process_madvise, pidfd, iov, (size_t)nv, MADV_PAGEOUT, 0U);
+            long r = fz_madvise(pidfd, iov, (size_t)nv);
             if (r > 0) done += r;
+            else if (r < 0 && fz_nosys("process_madvise")) break;
             nv = 0;
         }
     }
-    if (nv) {
-        long r = syscall(__NR_process_madvise, pidfd, iov, (size_t)nv, MADV_PAGEOUT, 0U);
+    if (nv && !fz_no_pageout) {
+        long r = fz_madvise(pidfd, iov, (size_t)nv);
         if (r > 0) done += r;
+        else if (r < 0) fz_nosys("process_madvise");
     }
     fclose(f);
     close(pidfd);

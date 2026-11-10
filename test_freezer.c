@@ -41,6 +41,11 @@ static int fake_write(const char *path, const char *val) {
     return ok ? 0 : -1;
 }
 
+static int madvise_calls;
+static long nosys_madvise(int fd, const struct iovec *iov, size_t n) {
+    (void)fd; (void)iov; (void)n; madvise_calls++; errno = ENOSYS; return -1;
+}
+
 static void clear_leaf(const char *leaf) {
     const char *files[] = {"cgroup.procs", "cgroup.freeze", "cgroup.events", 0};
     char p[PATHMAX + 32];
@@ -223,6 +228,11 @@ int main(void) {
     hc.active = 1; hc.idle = 1; hc.sampled = 1; hc.age_min = 90;
     char verdict2[96]; fz_verdict(c, &hc, verdict2, sizeof verdict2);
     EXPECT(!strcmp(verdict2, "active-cmd"), "active processes are reported as such");
+
+    fz_madvise = nosys_madvise;
+    EXPECT(fz_pageout((int)getpid()) <= 0 && fz_no_pageout, "missing process_madvise disables pageout");
+    EXPECT(fz_pageout((int)getpid()) < 0 && madvise_calls == 1, "pageout is not retried after ENOSYS");
+    fz_madvise = sys_process_madvise; fz_no_pageout = 0;
 
     int pipes[2]; EXPECT(!pipe(pipes), "pipe"); pid_t child = fork();
     if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
