@@ -147,7 +147,7 @@ int main(void) {
     label_source.rawlen = sizeof arguments - 1;
     xcpy(label_source.comm, sizeof label_source.comm, "python3");
     xcpy(label_source.exe, sizeof label_source.exe, "/usr/bin/python3");
-    fz_label(&label_source, "watched", safe_label, sizeof safe_label);
+    fz_label(c, &label_source, "watched", safe_label, sizeof safe_label);
     EXPECT(!strcmp(safe_label, "python3"), "generic process label must not copy an arbitrary command argument");
 
     fz_cand cand = {.kind = "watched", .age_min = 90, .sampled = 1, .idle = 1, .idle_min = 10};
@@ -171,6 +171,20 @@ int main(void) {
     c->dryrun = 0;
     EXPECT(fz_live(c), "live only with dry-run, monitor and autopilot all permitting");
     c->dryrun = 1;
+
+    static fz_proc jar; const char jar_args[] = "java\0-Xmx2G\0-jar\0paper-1.21.jar\0nogui\0";
+    memcpy(jar.raw, jar_args, sizeof jar_args); jar.rawlen = sizeof jar_args - 1;
+    xcpy(jar.exe, sizeof jar.exe, "/usr/bin/java"); xcpy(jar.cmd, sizeof jar.cmd, "java -Xmx2G -jar paper-1.21.jar nogui");
+    EXPECT(fz_classify(c, &jar, 512) == 0, "no game-specific jar names are built in");
+    cfg_apply(c, "FREEZE_SERVER_JARS", "paper,purpur");
+    EXPECT(fz_classify(c, &jar, 512) && !strcmp(fz_classify(c, &jar, 512), "game-server"), "configured jar prefix marks a game server");
+    fz_label(c, &jar, "game-server", safe_label, sizeof safe_label);
+    EXPECT(!strcmp(safe_label, "paper-1.21.jar"), "game server label is the jar name");
+    xcpy(jar.raw + 5, sizeof jar.raw - 5, "x"); jar.rawlen = 7;
+    xcpy(jar.cmd, sizeof jar.cmd, "java x org.example.ServerMain");
+    cfg_apply(c, "FREEZE_SERVER_MAIN", "org.example.ServerMain");
+    EXPECT(fz_classify(c, &jar, 512) && !strcmp(fz_classify(c, &jar, 512), "game-server"), "configured main class marks a game server");
+    cfg_defaults(c);
 
     int pipes[2]; EXPECT(!pipe(pipes), "pipe"); pid_t child = fork();
     if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }

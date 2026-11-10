@@ -32,7 +32,7 @@ typedef struct {
     int enable, monitor, poll_s, uptime_min, idle_min;
     int cpu_idle_pct, min_rss_mb, big_java_mb, java_big, gradle;
     int reclaim_mb, reclaim_max_s;
-    namelist watch, exclude, never, ignore;
+    namelist watch, exclude, never, ignore, server_jars, server_main;
     protect_list protect;
 } fz_config;
 
@@ -56,6 +56,7 @@ static void cfg_defaults(fz_config *c) {
     c->min_rss_mb = 128; c->big_java_mb = 1024;
     c->java_big = 0; c->gradle = 1;
     c->reclaim_mb = 256; c->reclaim_max_s = 60;
+    list_parse(&c->server_jars, "server");
 }
 
 static int cfg_integer(const char *value, int *out) {
@@ -77,6 +78,7 @@ static void cfg_apply(fz_config *c, const char *key, const char *val) {
     I("FREEZE_RECLAIM_MB", reclaim_mb) I("FREEZE_RECLAIM_MAX_S", reclaim_max_s)
     L("FREEZE_WATCH", watch) L("FREEZE_EXCLUDE", exclude)
     L("FREEZE_NEVER", never) L("FREEZE_IGNORE", ignore)
+    L("FREEZE_SERVER_JARS", server_jars) L("FREEZE_SERVER_MAIN", server_main)
     #undef I
     #undef L
 }
@@ -183,14 +185,6 @@ static int holds_gpu(int pid) {
 #define MADV_PAGEOUT 21
 #endif
 
-static const char *FZ_JAR[] = { "paper", "purpur", "folia", "spigot", "craftbukkit",
-    "bukkit", "leaf", "pufferfish", "velocity", "waterfall", "bungeecord", "forge",
-    "fabric-server", "quilt-server", "minecraft_server", "server", "husk", "raft", 0 };
-static const char *FZ_MAIN[] = { "io.papermc.paperclip",
-    "net.fabricmc.loader.impl.launch.knot.KnotServer", "net.minecraftforge.bootstrap",
-    "cpw.mods.bootstraplauncher", "net.minecraft.server.Main",
-    "net.fabricmc.devlaunchinjector", 0 };
-
 typedef struct {
     int  pid, ppid;
     unsigned long long start, ticks;
@@ -242,11 +236,11 @@ static const char *fz_base(const char *p) {
     return s ? s + 1 : p;
 }
 
-static int fz_server_jar(const char *b) {
+static int fz_server_jar(const fz_config *c, const char *b) {
     size_t n = strlen(b);
     if (n <= 4 || strcasecmp(b + n - 4, ".jar")) return 0;
-    for (int i = 0; FZ_JAR[i]; i++)
-        if (!strncasecmp(b, FZ_JAR[i], strlen(FZ_JAR[i]))) return 1;
+    for (int i = 0; i < c->server_jars.n; i++)
+        if (!strncasecmp(b, c->server_jars.v[i], strlen(c->server_jars.v[i]))) return 1;
     return 0;
 }
 
@@ -318,15 +312,15 @@ static const char *fz_classify(const fz_config *c, const fz_proc *p, long rss_mb
         off += (int)tl + 1;
         if (!tl) continue;
         if (!strcmp(tok, "-jar")) {
-            if (off < p->rawlen && fz_server_jar(fz_base(p->raw + off))) return "mc-server";
-        } else if (fz_server_jar(fz_base(tok))) return "mc-server";
+            if (off < p->rawlen && fz_server_jar(c, fz_base(p->raw + off))) return "game-server";
+        } else if (fz_server_jar(c, fz_base(tok))) return "game-server";
     }
-    for (int i = 0; FZ_MAIN[i]; i++) if (strstr(p->cmd, FZ_MAIN[i])) return "mc-server";
+    if (fz_list_hit(&c->server_main, p->cmd)) return "game-server";
     if (rss_mb >= c->big_java_mb) return "java-big";
     return 0;
 }
 
-static void fz_label(const fz_proc *p, const char *kind, char *out, size_t cap) {
+static void fz_label(const fz_config *c, const fz_proc *p, const char *kind, char *out, size_t cap) {
     if (!strcmp(kind, "gradle-daemon")) { xcpy(out, cap, "GradleDaemon"); return; }
     if (strncmp(fz_base(p->exe), "java", 4)) {
         xcpy(out, cap, p->comm[0] ? p->comm : fz_base(p->exe)); return;
@@ -337,7 +331,7 @@ static void fz_label(const fz_proc *p, const char *kind, char *out, size_t cap) 
         off += (int)tl + 1;
         if (!tl) continue;
         if (!strcmp(tok, "-jar") && off < p->rawlen) { xcpy(out, cap, fz_base(p->raw + off)); return; }
-        if (fz_server_jar(fz_base(tok))) { xcpy(out, cap, fz_base(tok)); return; }
+        if (fz_server_jar(c, fz_base(tok))) { xcpy(out, cap, fz_base(tok)); return; }
     }
     /* Generic arguments can contain source code, credentials or private text.
      * Keep only comm/executable identity outside the explicit jar cases. */
@@ -859,7 +853,7 @@ static int fz_freeze_pid(const fz_config *c, int pid) {
     if (fz_is_frozen(pid)) { printf("Already frozen: %d\n", pid); return 1; }
     char label[FZ_NAMELEN];
     const char *kind = fz_classify(c, &p, p.rss_kb / 1024);
-    fz_label(&p, kind ? kind : "process", label, sizeof label);
+    fz_label(c, &p, kind ? kind : "process", label, sizeof label);
     return fz_freeze(c, &p, kind ? kind : "process", label, "manual request") == 0 ? 0 : 1;
 }
 
@@ -909,7 +903,7 @@ static int fz_evaluate(const fz_config *c, fz_state *fs, const fz_proc *p,
     s->ticks = p->ticks;
     s->last_seen = now;
 
-    fz_label(p, k->kind, k->label, sizeof k->label);
+    fz_label(c, p, k->kind, k->label, sizeof k->label);
     k->cpu_pct = s->cpu_pct;
     k->sampled = s->sampled;
     k->idle = s->idle_since != 0;
