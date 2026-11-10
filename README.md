@@ -63,7 +63,9 @@ and verdict of one candidate. When the verdicts look right for a few days, set
       freeze PID    freeze a process tree now, ignoring the idle thresholds
       thaw SPEC     thaw by name, pid, cgroup name or all
 
-`list` needs only read access to `/run/oom-freezer/frozen`. `freeze` and
+`once` starts without a CPU sample, so it only writes `freeze.state` with
+`no-sample` verdicts and never acts. `list` needs only read access to
+`/run/oom-freezer/frozen`. `freeze` and
 `thaw` need root. One-shot commands print their log lines to stderr as well.
 The environment variables `OOM_FREEZER_CONF` and `OOM_FREEZER_STATE` override
 the config path and the state directory.
@@ -101,8 +103,8 @@ code is evaluated. Unknown keys are logged. Reload with
 
 Substring lists match the command line, the working directory and the
 executable path, case-insensitive, comma-separated, at most 32 entries of up
-to 31 bytes; extra entries are dropped with a warning. String values must not
-carry an inline comment.
+to 31 bytes; extra entries are dropped with a warning. An unquoted value ends
+at `#`, so quote a value that contains `#`.
 
 
 ## How it decides
@@ -188,8 +190,8 @@ with a pointer to `oom-freezer thaw`.
 
 ## Why did my server stop responding?
 
-A frozen process looks hung: it accepts TCP connections in the kernel backlog
-but never answers, uses 0 % CPU, and its state in `ps` is `S` or `D`. If a
+A frozen process looks hung: connections reach the kernel backlog but are
+never answered, and it uses no CPU at all. If a
 service that sat idle for a while suddenly stops answering, check whether it
 was frozen:
 
@@ -241,8 +243,9 @@ Two ways out:
   order, the dry-run switch, the recovery registry (atomic replace, refusal of
   symlinks, partial and oversized files, path traversal), thaw failure paths,
   label privacy, process tree completeness, rollback at each failure point of a
-  freeze (migration, freeze write, freeze not confirmed, registry) on a fake
-  cgroup tree, the activity check (exit 0, exit 1, other status, timeout,
+  freeze (migration, partial migration of a two process tree, freeze write,
+  freeze not confirmed, registry) on a fake cgroup tree, the scan loop end to
+  end in dry-run with two idle fixtures and an activity check, the activity check (exit 0, exit 1, other status, timeout,
   missing program), game server jar configuration, `list` output, strict pid
   parsing, list overflow warnings, pageout on a kernel without
   `process_madvise`, the own-tree protection and the start-up support checks.
@@ -258,8 +261,8 @@ process, checks that the recovery record exists before the first pageout,
 breaks the original cgroup and the registry to check that thaw keeps the
 record and a retry completes, and checks that the fixture's data is intact.
 
-Not covered by tests: the full scan loop acting on real candidates, the Gradle
-SIGTERM path, GPU detection, the ancestry walk of the protect list on a real
+Not covered by tests: the scan loop freezing real candidates in live mode, the
+Gradle SIGTERM path, GPU detection, the ancestry walk of the protect list on a real
 desktop, and reclaim on large processes.
 
 This README was written from the code. The behaviour described in "How it
@@ -271,8 +274,12 @@ are the ones exercised by tests.
 - Linux with cgroup v2 only. The binary exits with a message when
   `/sys/fs/cgroup/cgroup.controllers` is missing (cgroup v1), when the kernel
   has no `cgroup.freeze` (before 5.2), or when it would act without write
-  access to `/sys/fs/cgroup` (an unprivileged container). Dry-run works without
+  access to `/sys/fs/cgroup` (an unprivileged container). It exits with status
+  78 in these cases and the unit does not restart on it. Dry-run works without
   write access.
+- Memory pressure (PSI) is not read. The freezer acts on idleness and size,
+  not on pressure; reacting to pressure is the job of an OOM killer such as
+  aegis-oom.
 - Pageout needs `process_madvise` (Linux 5.10); without it the freeze still
   works, pageout is disabled with one log line, and `memory.reclaim`
   (Linux 5.19) is the only way memory is returned. Freed memory goes to swap or

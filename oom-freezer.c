@@ -195,6 +195,8 @@ static int holds_gpu(int pid) {
 #define FZ_RECLAIM_STALL   (1L * 1024 * 1024)  /* progress smaller than this is a stall */
 #define FZ_RECLAIM_PAUSE_US 100000
 #define FZ_POLL_STEP_MS    50
+/* Exit status for a system that cannot freeze; the unit does not restart on it. */
+#define FZ_EXIT_UNSUPPORTED 78
 #define FZ_MAXTREE  256             /* processes in one frozen tree */
 #define FZ_KEYLEN   40
 #define FZ_NAMELEN  64
@@ -1204,7 +1206,7 @@ int main(int argc, char **argv) {
     signal(SIGHUP, on_hup);
     signal(SIGPIPE, SIG_IGN);
 
-    if (fz_support(needs_arg || !cfg.dryrun) != 0) return 1;
+    if (fz_support(needs_arg || !cfg.dryrun) != 0) return FZ_EXIT_UNSUPPORTED;
     if (!strcmp(cmd, "thaw")) return fz_thaw(&cfg, arg) >= 0 ? 0 : 1;
     if (!strcmp(cmd, "freeze")) return fz_freeze_pid(&cfg, freeze_pid);
     if (!strcmp(cmd, "once")) { freeze_check(&cfg, &state); return 0; }
