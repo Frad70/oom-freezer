@@ -1,5 +1,7 @@
 static char *test_freezer_root = "/proc/oom-freezer-tests-never-created";
 #define FZ_ROOT test_freezer_root
+static char *test_cgroup_mnt = "/proc/oom-freezer-tests-never-created";
+#define FZ_MNT test_cgroup_mnt
 #define main oom_freezer_main
 #include "oom-freezer.c"
 #undef main
@@ -11,6 +13,113 @@ static int failures;
 static void registry_text(const char *path, const char *value) {
     FILE *f = fopen(path, "w"); if (!f) exit(2);
     fputs(value, f); fclose(f);
+}
+
+static const char *fake_root, *fail_dir, *fail_suffix, *fail_value;
+static int fake_events = 1;
+
+/* Stands in for cgroupfs: plain files, events follow cgroup.freeze, and a
+ * write matching fail_dir, fail_suffix and fail_value fails with EIO. */
+static int fake_write(const char *path, const char *val) {
+    if (strncmp(path, fake_root, strlen(fake_root))) {
+        fprintf(stderr, "FAIL: write outside the fake cgroup tree: %s\n", path); exit(3);
+    }
+    size_t pl = strlen(path);
+    if (fail_suffix && !strncmp(path, fail_dir, strlen(fail_dir)) && pl >= strlen(fail_suffix) &&
+        !strcmp(path + pl - strlen(fail_suffix), fail_suffix) && (!fail_value || !strcmp(val, fail_value))) {
+        errno = EIO; return -1;
+    }
+    int procs = pl >= 12 && !strcmp(path + pl - 12, "cgroup.procs");
+    int fd = open(path, O_WRONLY | O_CREAT | (procs ? O_APPEND : O_TRUNC), 0644);
+    if (fd < 0) return -1;
+    char line[64]; int n = snprintf(line, sizeof line, procs ? "%s\n" : "%s", val);
+    int ok = write(fd, line, (size_t)n) == n; close(fd);
+    if (ok && fake_events && pl >= 13 && !strcmp(path + pl - 13, "cgroup.freeze")) {
+        char ev[PATHMAX + 32]; snprintf(ev, sizeof ev, "%.*s/cgroup.events", (int)(pl - 14), path);
+        FILE *f = fopen(ev, "w"); if (f) { fprintf(f, "populated 1\nfrozen %s\n", val); fclose(f); }
+    }
+    return ok ? 0 : -1;
+}
+
+static void clear_leaf(const char *leaf) {
+    const char *files[] = {"cgroup.procs", "cgroup.freeze", "cgroup.events", 0};
+    char p[PATHMAX + 32];
+    for (int i = 0; files[i]; i++) { snprintf(p, sizeof p, "%s/%s", leaf, files[i]); unlink(p); }
+    rmdir(leaf);
+}
+
+static int file_has(const char *path, const char *needle) {
+    char b[4096]; return read_file(path, b, sizeof b) >= 0 && strstr(b, needle);
+}
+
+static int mkdirs(char *path) {
+    for (char *s = path + 1; *s; s++) if (*s == '/') { *s = 0; mkdir(path, 0700); *s = '/'; }
+    return mkdir(path, 0700) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+/* Each failure point after the cgroup move must thaw and move the task back. */
+static void rollback_tests(fz_config *c, const char *state) {
+    int pipes[2]; if (pipe(pipes)) { failures++; return; }
+    pid_t child = fork();
+    if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
+    close(pipes[0]);
+    char orig[PATHMAX]; fz_cgroup_of(child, orig, sizeof orig);
+    if (!orig[0] || !fz_valid_original(orig)) {
+        puts("SKIP: rollback tests need a cgroup v2 path in /proc/self/cgroup");
+        close(pipes[1]); waitpid(child, NULL, 0); return;
+    }
+    char mnt[] = "/tmp/oom-freezer-cgfs-XXXXXX", root[PATHMAX], origdir[2 * PATHMAX], origprocs[2 * PATHMAX + 16];
+    EXPECT(mkdtemp(mnt), "fake cgroup mount");
+    snprintf(root, sizeof root, "%s/oom-freezer", mnt);
+    snprintf(origdir, sizeof origdir, "%s%s", mnt, orig);
+    snprintf(origprocs, sizeof origprocs, "%s/cgroup.procs", origdir);
+    EXPECT(!mkdirs(origdir), "fake original cgroup");
+    test_cgroup_mnt = mnt; test_freezer_root = root; fake_root = mnt;
+    fz_write = fake_write; fz_wait_ms = 100;
+
+    static fz_proc p;
+    EXPECT(!fz_read(child, &p), "fixture readable");
+    char leaf[2 * PATHMAX], ff[2 * PATHMAX + 16], reg[PATHMAX];
+    snprintf(leaf, sizeof leaf, "%s/fixture-%d-%llu", root, (int)child, p.start);
+    snprintf(ff, sizeof ff, "%s/cgroup.freeze", leaf);
+    snprintf(reg, sizeof reg, "%s/frozen", state);
+    char pidline[32]; snprintf(pidline, sizeof pidline, "%d\n", (int)child);
+
+    struct { const char *suffix, *value; int events, registry_broken; const char *what; } cases[] = {
+        {"cgroup.procs", 0, 1, 0, "migration failure"},
+        {"cgroup.freeze", "1", 1, 0, "freeze write failure"},
+        {0, 0, 0, 0, "freeze not confirmed"},
+        {0, 0, 1, 1, "recovery registry failure"},
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        clear_leaf(leaf); unlink(origprocs); unlink(reg);
+        if (cases[i].registry_broken && symlink("/dev/full", reg)) failures++;
+        fail_dir = root; fail_suffix = cases[i].suffix; fail_value = cases[i].value; fake_events = cases[i].events;
+        char m[128];
+        snprintf(m, sizeof m, "%s: freeze reports failure", cases[i].what);
+        EXPECT(fz_freeze(c, &p, "watched", "fixture", "test") < 0, m);
+        snprintf(m, sizeof m, "%s: cgroup left thawed", cases[i].what);
+        EXPECT(!file_has(ff, "1"), m);
+        if (i > 0) {
+            snprintf(m, sizeof m, "%s: task moved back to its original cgroup", cases[i].what);
+            EXPECT(file_has(origprocs, pidline), m);
+        }
+        snprintf(m, sizeof m, "%s: no recovery record left behind", cases[i].what);
+        EXPECT(!file_has(reg, "frozen "), m);
+        unlink(reg);
+    }
+    clear_leaf(leaf); unlink(origprocs);
+    fail_suffix = 0; fake_events = 1;
+    EXPECT(fz_freeze(c, &p, "watched", "fixture", "test") == 0, "freeze succeeds on a working fake tree");
+    EXPECT(file_has(ff, "1") && file_has(reg, "phase=frozen"), "success leaves a frozen leaf and a final record");
+
+    clear_leaf(leaf); unlink(reg); unlink(origprocs);
+    for (char *s = origdir + strlen(origdir); s > origdir + strlen(mnt); s--) if (*s == '/') { rmdir(origdir); *s = 0; }
+    rmdir(origdir);
+    char subtree[PATHMAX + 32]; snprintf(subtree, sizeof subtree, "%s/cgroup.subtree_control", root);
+    unlink(subtree); rmdir(root); rmdir(mnt);
+    fz_write = fz_write_file; fz_wait_ms = 5000;
+    close(pipes[1]); waitpid(child, NULL, 0);
 }
 
 int main(void) {
@@ -122,6 +231,7 @@ int main(void) {
     EXPECT(fz_thaw(c, "all") == 1, "retry finishes recovery for a confirmed absent leaf");
     EXPECT(read_file(path, actual, sizeof actual) == 0, "completed recovery is removed on retry");
     rmdir(root);
+    rollback_tests(c, state);
     unlink(path); snprintf(path, sizeof path, "%s/frozen.lock", state); unlink(path); rmdir(state);
     if (failures) return 1;
     puts("OK: freezer safety"); return 0;

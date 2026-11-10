@@ -161,6 +161,9 @@ static int holds_gpu(int pid) {
  * the second step: after a thaw, pages come back charged to our cgroup, and
  * the next freeze makes use of that. */
 
+#ifndef FZ_MNT
+#define FZ_MNT      "/sys/fs/cgroup"
+#endif
 #ifndef FZ_ROOT
 #define FZ_ROOT     "/sys/fs/cgroup/oom-freezer"
 #endif
@@ -214,7 +217,7 @@ typedef struct {
     long    last;
 } fz_state;
 
-static int fz_write_str(const char *path, const char *val) {
+static int fz_write_file(const char *path, const char *val) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     ssize_t n = write(fd, val, strlen(val));
@@ -223,6 +226,10 @@ static int fz_write_str(const char *path, const char *val) {
     errno = e;
     return n == (ssize_t)strlen(val) ? 0 : -1;
 }
+
+/* Every cgroup control write goes through this pointer so tests can inject failures. */
+static int (*fz_write)(const char *path, const char *val) = fz_write_file;
+static int fz_wait_ms = 5000;
 
 static void fz_sanitize(char *s) {
     for (; *s; s++)
@@ -371,10 +378,10 @@ static void fz_cgroup_of(int pid, char *out, size_t cap) {
  * and it must become a candidate again, or a thawed process could never be frozen again. */
 /* cgroup-relative path of FZ_ROOT, compared by its own length */
 static int fz_in_root(const char *cg) {
-    static const char mnt[] = "/sys/fs/cgroup";
-    const char *root = FZ_ROOT;
-    if (strncmp(root, mnt, sizeof mnt - 1)) return 0;
-    root += sizeof mnt - 1;
+    const char *mnt = FZ_MNT, *root = FZ_ROOT;
+    size_t m = strlen(mnt);
+    if (strncmp(root, mnt, m)) return 0;
+    root += m;
     size_t n = strlen(root);
     return n && !strncmp(cg, root, n) && cg[n] == '/';
 }
@@ -383,7 +390,7 @@ static int fz_is_frozen(int pid) {
     char cg[PATHMAX], p[PATHMAX + 32], b[32];
     fz_cgroup_of(pid, cg, sizeof cg);
     if (!fz_in_root(cg)) return 0;
-    snprintf(p, sizeof p, "/sys/fs/cgroup%s/cgroup.freeze", cg);
+    snprintf(p, sizeof p, "%s%s/cgroup.freeze", FZ_MNT, cg);
     if (read_file(p, b, sizeof b) < 0) return 0;
     return atoi(b) == 1;
 }
@@ -493,7 +500,7 @@ static long fz_reclaim(const fz_config *c, const char *cg, long *out_current) {
     while (cur > 4L * 1024 * 1024 && stall < 2 && mono_s() < deadline) {
         char v[32];
         snprintf(v, sizeof v, "%ld", cur < chunk ? cur : chunk);
-        fz_write_str(p_rec, v);
+        fz_write(p_rec, v);
         long now = read_long_file(p_cur, cur);
         if (cur - now < 1L * 1024 * 1024) stall++; else stall = 0;
         cur = now;
@@ -523,8 +530,9 @@ static int fz_move_back(const char *cg, const char *orig) {
     if (!fz_valid_original(orig)) return -1;
     char src[PATHMAX + 32], dst[PATHMAX + 32], buf[8192];
     snprintf(src, sizeof src, "%s/cgroup.procs", cg);
-    snprintf(dst, sizeof dst, "/sys/fs/cgroup%s/cgroup.procs", orig);
+    snprintf(dst, sizeof dst, "%s%s/cgroup.procs", FZ_MNT, orig);
     int length = read_file(src, buf, sizeof buf);
+    if (length < 0 && errno == ENOENT) return 0;
     if (length < 0 || length == (int)sizeof buf - 1) return -1;
     int moved = 0;
     char *p = buf;
@@ -533,7 +541,7 @@ static int fz_move_back(const char *cg, const char *orig) {
         if (pid > 0) {
             char v[16];
             snprintf(v, sizeof v, "%d", pid);
-            if (fz_write_str(dst, v) == 0) moved++;
+            if (fz_write(dst, v) == 0) moved++;
             else if (errno != ESRCH) return -1;
         }
         char *nl = strchr(p, '\n');
@@ -642,21 +650,22 @@ static int fz_field(const char *line, const char *key, char *out, size_t cap) {
     return 0;
 }
 
-static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, const char *label, const char *why) {
+/* Fills pids with the whole tree of p, or refuses: a stale pid, a protected
+ * process or descendant, or a tree that could not be read completely. */
+static int fz_collect(const fz_config *c, const fz_proc *p, const char *label, int *pids, int cap) {
     static fz_proc live;
     if (fz_read(p->pid, &live) || live.start != p->start || fz_never(c, &live, label) || pid_protected(p->pid, &c->protect)) {
         lg(LOG_WARNING, "freeze cancelled: stale or protected process %d", p->pid); return -1;
     }
-    int pids[FZ_MAXTREE];
-    int n = fz_tree(p->pid, pids, FZ_MAXTREE);
+    int n = fz_tree(p->pid, pids, cap);
     if (n < 1) { lg(LOG_WARNING, "freeze cancelled: incomplete process tree"); return -1; }
     for (int i = 0; i < n; i++) if (pid_protected(pids[i], &c->protect) || holds_gpu(pids[i])) {
         lg(LOG_WARNING, "freeze cancelled: protected descendant"); return -1;
     }
-    char name[FZ_NAMELEN + 16], cg[PATHMAX], orig[PATHMAX];
-    snprintf(name, sizeof name, "%.32s-%d-%llu", label, p->pid, p->start);
-    fz_sanitize(name);
+    return n;
+}
 
+static int fz_make_leaf(const char *name, char *cg, size_t cap) {
     if (mkdir(FZ_ROOT, 0755) != 0 && errno != EEXIST) {
         lg(LOG_ERR, "freeze: cannot create %s: %s", FZ_ROOT, strerror(errno));
         return -1;
@@ -665,13 +674,60 @@ static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, con
      * parent grants the controller to a child, not the hierarchy root. */
     char subtree[PATHMAX+32];
     snprintf(subtree, sizeof subtree, "%s/cgroup.subtree_control", FZ_ROOT);
-    if (fz_write_str(subtree, "+memory") != 0 && errno != EEXIST)
+    if (fz_write(subtree, "+memory") != 0 && errno != EEXIST)
         lg(LOG_INFO, "freeze: memory controller not enabled on %s: %s", FZ_ROOT, strerror(errno));
-    snprintf(cg, sizeof cg, "%s/%s", FZ_ROOT, name);
+    snprintf(cg, cap, "%s/%s", FZ_ROOT, name);
     if (mkdir(cg, 0755) != 0 && errno != EEXIST) {
         lg(LOG_ERR, "freeze: cannot create %s: %s", cg, strerror(errno));
         return -1;
     }
+    return 0;
+}
+
+static int fz_migrate(const char *cg, const int *pids, int n) {
+    char pf[PATHMAX + 32];
+    snprintf(pf, sizeof pf, "%s/cgroup.procs", cg);
+    int moved = 0;
+    for (int i = 0; i < n; i++) {
+        char v[16];
+        snprintf(v, sizeof v, "%d", pids[i]);
+        if (fz_write(pf, v) == 0) moved++;
+    }
+    return moved;
+}
+
+/* Undo a partial freeze: thaw, move every task back, remove the leaf. */
+static int fz_rollback(const char *cg, const char *orig, const char *label, int pid, const char *why) {
+    char ff[PATHMAX + 32];
+    snprintf(ff, sizeof ff, "%s/cgroup.freeze", cg);
+    lg(LOG_ERR, "freeze: %s(%d) %s, rolling back", label, pid, why);
+    if (fz_write(ff, "0") != 0 && errno != ENOENT)
+        lg(LOG_ERR, "freeze: rollback could not thaw %s: %s", cg, strerror(errno));
+    if (fz_move_back(cg, orig) < 0)
+        lg(LOG_ERR, "freeze: rollback left tasks in %s; run oom-freezer thaw", cg);
+    rmdir(cg);
+    return -1;
+}
+
+static int fz_record(char *out, size_t cap, const char *key, int pid, const char *kind,
+                     const char *name, const char *orig, long pss0, long pss1, long swap1,
+                     long ts, int ntasks, const char *label, const char *phase) {
+    int w = snprintf(out, cap,
+        "frozen %s pid=%d kind=%s cg=%s orig=%s pss_before_kb=%ld pss_after_kb=%ld "
+        "swap_kb=%ld ts=%ld ntasks=%d name=%s phase=%s\n",
+        key, pid, kind, name, orig[0] ? orig : "-", pss0, pss1, swap1, ts, ntasks, label, phase);
+    return w < 0 || w >= (int)cap ? -1 : 0;
+}
+
+static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, const char *label, const char *why) {
+    int pids[FZ_MAXTREE];
+    int n = fz_collect(c, p, label, pids, FZ_MAXTREE);
+    if (n < 1) return -1;
+
+    char name[FZ_NAMELEN + 16], cg[PATHMAX], orig[PATHMAX];
+    snprintf(name, sizeof name, "%.32s-%d-%llu", label, p->pid, p->start);
+    fz_sanitize(name);
+    if (fz_make_leaf(name, cg, sizeof cg) != 0) return -1;
 
     fz_cgroup_of(p->pid, orig, sizeof orig);
     if (!fz_valid_original(orig)) { rmdir(cg); lg(LOG_ERR, "freeze: original cgroup is unknown"); return -1; }
@@ -680,30 +736,13 @@ static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, con
     long rss0, swap0;
     fz_footprint(pids, n, &rss0, &swap0);
 
-    char pf[PATHMAX + 32];
-    snprintf(pf, sizeof pf, "%s/cgroup.procs", cg);
-    int moved = 0;
-    for (int i = 0; i < n; i++) {
-        char v[16];
-        snprintf(v, sizeof v, "%d", pids[i]);
-        if (fz_write_str(pf, v) == 0) moved++;
-    }
-    if (moved != n) {
-        lg(LOG_ERR, "freeze: %s(%d) incomplete migration, rolling back: %d/%d", label, p->pid, moved, n);
-        fz_move_back(cg, orig);
-        rmdir(cg);
-        return -1;
-    }
+    int moved = fz_migrate(cg, pids, n);
+    if (moved != n) return fz_rollback(cg, orig, label, p->pid, "incomplete migration");
 
     char ff[PATHMAX + 32];
     snprintf(ff, sizeof ff, "%s/cgroup.freeze", cg);
-    if (fz_write_str(ff, "1") != 0 || fz_wait_frozen(cg, 1, 5000) != 0) {
-        lg(LOG_ERR, "freeze: %s(%d) cgroup did not freeze, rolling back", label, p->pid);
-        fz_write_str(ff, "0");
-        fz_move_back(cg, orig);
-        rmdir(cg);
-        return -1;
-    }
+    if (fz_write(ff, "1") != 0) return fz_rollback(cg, orig, label, p->pid, "freeze write failed");
+    if (fz_wait_frozen(cg, 1, fz_wait_ms) != 0) return fz_rollback(cg, orig, label, p->pid, "cgroup did not freeze");
 
     /* Reclaim may block longer than the systemd watchdog. Save recovery first,
      * with explicit unknown metrics until the final atomic update. */
@@ -711,14 +750,9 @@ static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, con
     xcpy(safe_label, sizeof safe_label, label); fz_sanitize(safe_label);
     snprintf(key, sizeof key, "%d:%llu", p->pid, p->start);
     long frozen_at = (long)time(0);
-    int written = snprintf(reg, sizeof reg,
-        "frozen %s pid=%d kind=%s cg=%s orig=%s pss_before_kb=%ld pss_after_kb=-1 "
-        "swap_kb=-1 ts=%ld ntasks=%d name=%s phase=reclaiming\n",
-        key, p->pid, kind, name, orig[0] ? orig : "-", rss0, frozen_at, moved, safe_label);
-    if (written < 0 || written >= (int)sizeof reg || fz_reg_append(c, reg) != 0) {
-        lg(LOG_ERR, "freeze: recovery registry unavailable, rolling back");
-        fz_write_str(ff, "0"); fz_move_back(cg, orig); rmdir(cg); return -1;
-    }
+    if (fz_record(reg, sizeof reg, key, p->pid, kind, name, orig, rss0, -1, -1,
+                  frozen_at, moved, safe_label, "reclaiming") != 0 || fz_reg_append(c, reg) != 0)
+        return fz_rollback(cg, orig, label, p->pid, "recovery registry unavailable");
 
     long advised = 0;
     for (int i = 0; i < n; i++) {
@@ -729,13 +763,8 @@ static int fz_freeze(const fz_config *c, const fz_proc *p, const char *kind, con
 
     long rss1, swap1;
     fz_footprint(pids, n, &rss1, &swap1);
-
-    written = snprintf(reg, sizeof reg,
-        "frozen %s pid=%d kind=%s cg=%s orig=%s pss_before_kb=%ld pss_after_kb=%ld "
-        "swap_kb=%ld ts=%ld ntasks=%d name=%s phase=frozen\n",
-        key, p->pid, kind, name, orig[0] ? orig : "-", rss0, rss1,
-        swap1, frozen_at, moved, safe_label);
-    if (written < 0 || written >= (int)sizeof reg || fz_reg_replace(c, key, reg) != 0)
+    if (fz_record(reg, sizeof reg, key, p->pid, kind, name, orig, rss0, rss1, swap1,
+                  frozen_at, moved, safe_label, "frozen") != 0 || fz_reg_replace(c, key, reg) != 0)
         lg(LOG_ERR, "freeze: final metrics unavailable; earlier recovery record retained");
 
     lg(LOG_WARNING, "frozen: %s(%d) kind=%s PSS %ld -> %ld kB, SwapPSS %ld -> %ld kB "
@@ -786,7 +815,7 @@ static int fz_thaw(const fz_config *c, const char *spec) {
                 struct stat st;
                 int absent = rootfd >= 0 && fstatat(rootfd, cgn, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT;
                 if (rootfd >= 0) close(rootfd);
-                int ok = !absent && fz_write_str(ff, "0") == 0 && fz_wait_frozen(cg, 0, 5000) == 0;
+                int ok = !absent && fz_write(ff, "0") == 0 && fz_wait_frozen(cg, 0, fz_wait_ms) == 0;
                 if (absent) {
                     remove = 1; done++;
                     printf("Recovery completed for absent cgroup %s\n", cgn);
