@@ -293,6 +293,15 @@ int main(void) {
     EXPECT(fz_thaw(c, "all") == 1, "retry finishes recovery for a confirmed absent leaf");
     EXPECT(read_file(path, actual, sizeof actual) == 0, "completed recovery is removed on retry");
     rmdir(root);
+    registry_text(path, "frozen 7:8 pid=7 kind=game-server cg=fixture-7-8 orig=- pss_before_kb=2097152 "
+                        "pss_after_kb=1024 swap_kb=2000000 ts=1700000000 ntasks=1 name=paper.jar phase=frozen\n");
+    char listing[] = "/tmp/oom-freezer-list-XXXXXX"; int lf = mkstemp(listing), saved = dup(1);
+    fflush(stdout); dup2(lf, 1); int lr = fz_list(c); fflush(stdout); dup2(saved, 1); close(saved);
+    char out[1024]; lseek(lf, 0, SEEK_SET); ssize_t on = read(lf, out, sizeof out - 1); close(lf); unlink(listing);
+    out[on > 0 ? on : 0] = 0;
+    EXPECT(lr == 0 && strstr(out, "paper.jar") && strstr(out, "2048 MiB") && strstr(out, "game-server"),
+           "list shows name, kind and size from the registry");
+    unlink(path);
     rollback_tests(c, state);
     unlink(path); snprintf(path, sizeof path, "%s/frozen.lock", state); unlink(path); rmdir(state);
     if (failures) return 1;

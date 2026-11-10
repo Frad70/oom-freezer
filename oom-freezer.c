@@ -1088,6 +1088,54 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
     fz_state_write(c, st, stlen);
 }
 
+/* CLI "list": the recovery registry with the live state of each cgroup. */
+static int fz_list(const fz_config *c) {
+    char reg[PATHMAX];
+    fz_reg_path(c, reg, sizeof reg);
+    static char buf[FZ_REG_MAX];
+    int len = read_file(reg, buf, sizeof buf);
+    if (len < 0 && errno != ENOENT) { fprintf(stderr, "%s: %s\n", reg, strerror(errno)); return 1; }
+    if (len <= 0 || !strstr(buf, "frozen ")) { puts("Nothing is frozen."); return 0; }
+    printf("%-24s %-8s %-12s %10s %10s %10s  %-16s %s\n",
+           "NAME", "PID", "KIND", "PSS_BEFORE", "PSS_AFTER", "SWAP", "SINCE", "STATE");
+    for (char *line = buf, *nl; line && *line; line = nl ? nl + 1 : 0) {
+        nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (strncmp(line, "frozen ", 7)) continue;
+        char name[FZ_NAMELEN] = "", pid[16] = "", kind[24] = "", cg[FZ_NAMELEN + 16] = "";
+        char before[24] = "", after[24] = "", swap[24] = "", ts[24] = "";
+        fz_field(line, "name=", name, sizeof name); fz_field(line, "pid=", pid, sizeof pid);
+        fz_field(line, "kind=", kind, sizeof kind); fz_field(line, "cg=", cg, sizeof cg);
+        fz_field(line, "pss_before_kb=", before, sizeof before);
+        fz_field(line, "pss_after_kb=", after, sizeof after);
+        fz_field(line, "swap_kb=", swap, sizeof swap); fz_field(line, "ts=", ts, sizeof ts);
+        char since[32] = "-";
+        time_t t = (time_t)atol(ts);
+        struct tm tm;
+        if (t > 0 && localtime_r(&t, &tm)) strftime(since, sizeof since, "%Y-%m-%d %H:%M", &tm);
+        const char *state = "missing";
+        char ff[PATHMAX + FZ_NAMELEN + 32], v[8];
+        if (fz_valid_component(cg)) {
+            snprintf(ff, sizeof ff, "%s/%s/cgroup.freeze", FZ_ROOT, cg);
+            if (read_file(ff, v, sizeof v) > 0) state = v[0] == '1' ? "frozen" : "thawed";
+        }
+        int p;
+        if (parse_pid(pid, &p) && kill(p, 0) != 0 && errno == ESRCH) state = "dead";
+        printf("%-24s %-8s %-12s %7ld MiB %7ld MiB %7ld MiB  %-16s %s\n", name, pid, kind,
+               atol(before) / 1024, atol(after) / 1024, atol(swap) / 1024, since, state);
+    }
+    return 0;
+}
+
+static void usage(FILE *f) {
+    fputs("Usage: oom-freezer [--conf FILE] [COMMAND]\n"
+          "  daemon        run the freezer loop (default)\n"
+          "  once          run one scan and exit\n"
+          "  list          show frozen processes\n"
+          "  freeze PID    freeze a process tree now, ignoring the idle thresholds\n"
+          "  thaw SPEC     thaw by name, pid, cgroup name or all\n", f);
+}
+
 /* ================================= main ================================== */
 
 int main(int argc, char **argv) {
@@ -1098,24 +1146,28 @@ int main(int argc, char **argv) {
     if (conf && *conf) conf_path = conf;
     const char *sd = getenv("OOM_FREEZER_STATE");
     if (sd && *sd) cfg.state_dir = sd;
-    int once = 0;
-    const char *thaw = 0;
-    int freeze_pid = 0, manual = 0;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--once")) once = 1;
-        else if (!strcmp(argv[i], "--conf") && i + 1 < argc) conf_path = argv[++i];
-        else if (!strcmp(argv[i], "--thaw") && i + 1 < argc) thaw = argv[++i];
-        else if (!strcmp(argv[i], "--freeze") && i + 1 < argc) {
-            if (!parse_pid(argv[++i], &freeze_pid)) { fprintf(stderr, "oom-freezer: invalid pid \"%s\"\n", argv[i]); return 2; }
-            manual = 1;
-        }
-        /* An argument without a value used to fall through every branch, and a
-         * one-shot command silently became a second daemon. Unknown is an error. */
-        else { fprintf(stderr, "oom-freezer: unknown argument \"%s\"\n", argv[i]); return 2; }
+    int i = 1;
+    for (; i < argc && !strncmp(argv[i], "--", 2); i++) {
+        if (!strcmp(argv[i], "--conf") && i + 1 < argc) conf_path = argv[++i];
+        else if (!strcmp(argv[i], "--help")) { usage(stdout); return 0; }
+        else { fprintf(stderr, "oom-freezer: unknown option \"%s\"\n", argv[i]); usage(stderr); return 2; }
+    }
+    const char *cmd = i < argc ? argv[i++] : "daemon";
+    const char *arg = i < argc ? argv[i++] : 0;
+    int needs_arg = !strcmp(cmd, "freeze") || !strcmp(cmd, "thaw");
+    if (i < argc || (needs_arg && !arg) || (!needs_arg && arg) ||
+        (!needs_arg && strcmp(cmd, "daemon") && strcmp(cmd, "once") && strcmp(cmd, "list"))) {
+        usage(stderr); return 2;
+    }
+    int freeze_pid = 0;
+    if (!strcmp(cmd, "freeze") && !parse_pid(arg, &freeze_pid)) {
+        fprintf(stderr, "oom-freezer: invalid pid \"%s\"\n", arg); return 2;
     }
 
-    openlog("oom-freezer", LOG_PID, LOG_DAEMON);
+    /* One-shot commands also print their log lines, so a refusal is visible. */
+    openlog("oom-freezer", LOG_PID | (strcmp(cmd, "daemon") ? LOG_PERROR : 0), LOG_DAEMON);
     cfg_load(&cfg, conf_path);
+    if (!strcmp(cmd, "list")) return fz_list(&cfg);
     mkdir(cfg.state_dir, 0755);
 
     signal(SIGTERM, on_term);
@@ -1123,9 +1175,9 @@ int main(int argc, char **argv) {
     signal(SIGHUP, on_hup);
     signal(SIGPIPE, SIG_IGN);
 
-    if (thaw) return fz_thaw(&cfg, thaw) >= 0 ? 0 : 1;
-    if (manual) return fz_freeze_pid(&cfg, freeze_pid);
-    if (once) { freeze_check(&cfg, &state); return 0; }
+    if (!strcmp(cmd, "thaw")) return fz_thaw(&cfg, arg) >= 0 ? 0 : 1;
+    if (!strcmp(cmd, "freeze")) return fz_freeze_pid(&cfg, freeze_pid);
+    if (!strcmp(cmd, "once")) { freeze_check(&cfg, &state); return 0; }
 
     notify_init();
     lg(LOG_NOTICE, "started dryrun=%d interval=%d s", cfg.dryrun, cfg.interval);

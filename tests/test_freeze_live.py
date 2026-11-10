@@ -89,7 +89,7 @@ for line in sys.stdin: print(sum(data[::4096]), flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(privileged, *env, 'LD_PRELOAD=' + str(preload),
                                      'FREEZER_TEST_OBSERVER=' + str(directory), helper,
-                                     '--conf', conf, '--freeze', child.pid, timeout=20)
+                                     '--conf', conf, 'freeze', child.pid, timeout=20)
                 try:
                     deadline = time.monotonic() + 10
                     observed = directory / 'observed'
@@ -114,7 +114,7 @@ for line in sys.stdin: print(sum(data[::4096]), flush=True)
             # A partial thaw must keep the registry, allowing a later retry.
             privileged('rmdir', cg / 'origin.scope')
             try:
-                privileged(*env, helper, '--conf', conf, '--thaw', child.pid, timeout=10)
+                privileged(*env, helper, '--conf', conf, 'thaw', child.pid, timeout=10)
                 raise AssertionError('missing destination must fail thaw')
             except subprocess.CalledProcessError:
                 pass
@@ -127,14 +127,14 @@ for line in sys.stdin: print(sum(data[::4096]), flush=True)
             # removal. No writes follow this symlink (O_NOFOLLOW).
             privileged('ln', '-s', '/dev/full', state / 'frozen.tmp')
             try:
-                privileged(*env, helper, '--conf', conf, '--thaw', child.pid, timeout=10)
+                privileged(*env, helper, '--conf', conf, 'thaw', child.pid, timeout=10)
                 raise AssertionError('blocked registry commit must fail thaw')
             except subprocess.CalledProcessError:
                 pass
             assert not leaf.exists() and (state / 'frozen').read_text() == record
             if (state / 'frozen.tmp').is_symlink():
                 privileged('rm', state / 'frozen.tmp')
-            privileged(*env, helper, '--conf', conf, '--thaw', child.pid, timeout=10)
+            privileged(*env, helper, '--conf', conf, 'thaw', child.pid, timeout=10)
             assert not (state / 'frozen').read_text()
             print('PASS: retry completes registry cleanup after cgroup removal', flush=True)
             assert str(child.pid) in (cg / 'origin.scope/cgroup.procs').read_text().splitlines()
