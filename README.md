@@ -166,7 +166,7 @@ Freezing a process:
 6. Replace the record with the final PSS and swap figures.
 
 If any step from 3 to 4 fails, the leaf is thawed, the tasks are moved back to
-their original cgroup and the leaf is removed. A failure to move back is logged
+their original cgroup and removal of the leaf is attempted. A failure to move back is logged
 with a pointer to `oom-freezer thaw`.
 
 ## What is never frozen
