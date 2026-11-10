@@ -41,6 +41,28 @@ int main(void) {
     fz_label(&label_source, "watched", safe_label, sizeof safe_label);
     EXPECT(!strcmp(safe_label, "python3"), "generic process label must not copy an arbitrary command argument");
 
+    fz_cand cand = {.kind = "watched", .age_min = 90, .sampled = 1, .idle = 1, .idle_min = 10};
+    char verdict[96];
+    fz_verdict(c, &cand, verdict, sizeof verdict);
+    EXPECT(!strcmp(verdict, "idle-10-of-30-min"), "idle but below the idle threshold");
+    cand.idle_min = 45; cand.forgotten = 1;
+    fz_verdict(c, &cand, verdict, sizeof verdict);
+    EXPECT(!strcmp(verdict, "FORGOTTEN"), "idle long enough is forgotten");
+    cand.excluded = "server"; cand.never = "sshd";
+    fz_verdict(c, &cand, verdict, sizeof verdict);
+    EXPECT(!strcmp(verdict, "excluded:server"), "exclusion is reported before every other check");
+    cand.excluded = 0;
+    fz_verdict(c, &cand, verdict, sizeof verdict);
+    EXPECT(!strcmp(verdict, "never:sshd"), "never list is reported before age and idleness");
+    cand.never = 0; cand.age_min = 5;
+    fz_verdict(c, &cand, verdict, sizeof verdict);
+    EXPECT(!strcmp(verdict, "young"), "young processes are not frozen");
+    c->monitor = 0; c->dryrun = 1;
+    EXPECT(!fz_live(c), "dry-run never acts");
+    c->dryrun = 0;
+    EXPECT(fz_live(c), "live only with dry-run, monitor and autopilot all permitting");
+    c->dryrun = 1;
+
     int pipes[2]; EXPECT(!pipe(pipes), "pipe"); pid_t child = fork();
     if (!child) { close(pipes[1]); char b; (void)read(pipes[0], &b, 1); _exit(0); }
     close(pipes[0]); EXPECT(child > 0, "child fixture");

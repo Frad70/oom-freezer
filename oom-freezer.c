@@ -846,6 +846,110 @@ static fz_slot *fz_slot_get(fz_state *st, const char *key) {
     return &st->slots[free_i];
 }
 
+static int fz_live(const fz_config *c) { return !c->monitor && !c->dryrun && c->autopilot; }
+
+typedef struct {
+    const char *kind, *excluded, *never;
+    char   key[FZ_KEYLEN], label[FZ_NAMELEN];
+    double cpu_pct, age_min, idle_min;
+    int    sampled, idle, forgotten, optout;
+} fz_cand;
+
+/* Classify one process and update its CPU sample. Returns 0 when it is not a
+ * candidate at all, so it gets neither a state line nor a slot. */
+static int fz_evaluate(const fz_config *c, fz_state *fs, const fz_proc *p,
+                       long now, double dt, long hz, double up, fz_cand *k) {
+    memset(k, 0, sizeof *k);
+    long rss_mb = p->rss_kb / 1024;
+    if (rss_mb < c->min_rss_mb) return 0;
+    k->kind = fz_classify(c, p, rss_mb);
+    if (!k->kind) return 0;
+    if (fz_list_hit(&c->ignore, p->hay)) return 0;
+    if (rss_mb < (!strcmp(k->kind, "java-big") ? c->big_java_mb : c->min_rss_mb)) return 0;
+    if (fz_is_frozen(p->pid)) return 0;
+
+    snprintf(k->key, sizeof k->key, "%d:%llu", p->pid, p->start);
+    fz_slot *s = fz_slot_get(fs, k->key);
+    if (!s) return 0;
+    if (dt > 0 && s->last_seen && p->ticks >= s->ticks) {
+        s->cpu_pct = (double)(p->ticks - s->ticks) * 100.0 / ((double)hz * dt);
+        s->sampled = 1;
+        if (s->cpu_pct < c->cpu_idle_pct) { if (!s->idle_since) s->idle_since = now; }
+        else s->idle_since = 0;
+    }
+    s->ticks = p->ticks;
+    s->last_seen = now;
+
+    fz_label(p, k->kind, k->label, sizeof k->label);
+    k->cpu_pct = s->cpu_pct;
+    k->sampled = s->sampled;
+    k->idle = s->idle_since != 0;
+    k->age_min = (up - (double)p->start / (double)hz) / 60.0;
+    k->idle_min = s->idle_since ? (double)(now - s->idle_since) / 60.0 : 0;
+    k->excluded = fz_list_hit(&c->exclude, p->hay);
+    k->never = k->excluded ? 0 : fz_never(c, p, k->label);
+    k->forgotten = !k->excluded && !k->never && k->age_min >= c->uptime_min &&
+                   k->idle && k->idle_min >= c->idle_min;
+    k->optout = k->forgotten && ((!strcmp(k->kind, "java-big") && !c->java_big) ||
+                                 (!strcmp(k->kind, "gradle-daemon") && !c->gradle));
+    return 1;
+}
+
+static void fz_verdict(const fz_config *c, const fz_cand *k, char *out, size_t cap) {
+    if (k->excluded)                  snprintf(out, cap, "excluded:%s", k->excluded);
+    else if (k->never)                snprintf(out, cap, "never:%s", k->never);
+    else if (k->age_min < c->uptime_min) snprintf(out, cap, "young");
+    else if (!k->sampled)             snprintf(out, cap, "no-sample");
+    else if (!k->idle)                snprintf(out, cap, "busy");
+    else if (!k->forgotten)           snprintf(out, cap, "idle-%.0f-of-%d-min", k->idle_min, c->idle_min);
+    else if (k->optout)               snprintf(out, cap, "FORGOTTEN-opt-in-off");
+    else                              snprintf(out, cap, "FORGOTTEN");
+}
+
+/* Returns 1 when an action was taken (or would be, in dry-run). */
+static int fz_act(const fz_config *c, const fz_proc *p, const fz_cand *k) {
+    char why[96], rl[64];
+    snprintf(why, sizeof why, "idle %.0f min, CPU %.1f%%, uptime %.0f min",
+             k->idle_min, k->cpu_pct, k->age_min);
+    snprintf(rl, sizeof rl, "fz:%s", k->key);
+    if (!rate_ok(rl, 900)) return 0;
+
+    if (!fz_live(c)) {
+        lg(LOG_NOTICE, "freeze[monitor]: would freeze %s(%d) kind=%s %ld MB | %s",
+           k->label, p->pid, k->kind, p->rss_kb / 1024, why);
+        rate_mark(rl);
+        return 1;
+    }
+
+    /* GradleDaemon is not frozen: a frozen daemon silently hangs the next
+     * build because the client waits on its socket. The daemon is a cache and
+     * a new one starts by itself, so a forgotten one gets a regular SIGTERM. */
+    if (!strcmp(k->kind, "gradle-daemon")) {
+        if (kill(p->pid, SIGTERM) != 0) {
+            lg(LOG_ERR, "freeze: SIGTERM to GradleDaemon(%d) failed: %s", p->pid, strerror(errno));
+            return 0;
+        }
+        lg(LOG_WARNING, "terminated: gradle daemon(%d) rss %ld kB | %s", p->pid, p->rss_kb, why);
+        rate_mark(rl);
+        return 1;
+    }
+
+    if (fz_freeze(c, p, k->kind, k->label, why) != 0) return 0;
+    rate_mark(rl);
+    return 1;
+}
+
+static void fz_state_write(const fz_config *c, const char *buf, size_t len) {
+    char sp[PATHMAX], tmp[PATHMAX + 32];
+    snprintf(sp, sizeof sp, "%s/freeze.state", c->state_dir);
+    snprintf(tmp, sizeof tmp, "%s.tmp", sp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    ssize_t w = write(fd, buf, len);
+    close(fd);
+    if (w == (ssize_t)len) rename(tmp, sp); else unlink(tmp);
+}
+
 static void freeze_check(const fz_config *c, fz_state *fs) {
     if (!c->enable) return;
     long now = mono_s();
@@ -863,109 +967,31 @@ static void freeze_check(const fz_config *c, fz_state *fs) {
     static fz_proc p;
     static char st[16 * 1024];
     size_t stlen = 0;
-    struct dirent *e;
-    int acted = 0;
     appendf(st, sizeof st, &stlen,
             "# oom-freezer state v1\nmode %s\nthreshold_uptime_min %d\nthreshold_idle_min %d\n"
             "threshold_cpu_pct %d\njava_big_optin %d\n",
-            (c->monitor || c->dryrun || !c->autopilot) ? "monitor" : "live",
+            fz_live(c) ? "live" : "monitor",
             c->uptime_min, c->idle_min, c->cpu_idle_pct, c->java_big);
+    struct dirent *e;
+    int acted = 0;
     while ((e = readdir(d))) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
         int pid = atoi(e->d_name);
         if (pid <= 0 || fz_read(pid, &p) != 0) continue;
-        long rss_mb = p.rss_kb / 1024;
-        if (rss_mb < c->min_rss_mb) continue;
-        const char *kind = fz_classify(c, &p, rss_mb);
-        if (!kind) continue;
-        if (fz_list_hit(&c->ignore, p.hay)) continue;
-        if (rss_mb < (!strcmp(kind, "java-big") ? c->big_java_mb : c->min_rss_mb)) continue;
-        if (fz_is_frozen(pid)) continue;
-
-        char key[FZ_KEYLEN];
-        snprintf(key, sizeof key, "%d:%llu", pid, p.start);
-        fz_slot *s = fz_slot_get(fs, key);
-        if (!s) continue;
-        if (dt > 0 && s->last_seen && p.ticks >= s->ticks) {
-            s->cpu_pct = (double)(p.ticks - s->ticks) * 100.0 / ((double)hz * dt);
-            s->sampled = 1;
-            if (s->cpu_pct < c->cpu_idle_pct) { if (!s->idle_since) s->idle_since = now; }
-            else s->idle_since = 0;
-        }
-        s->ticks = p.ticks;
-        s->last_seen = now;
-
-        char label[FZ_NAMELEN];
-        fz_label(&p, kind, label, sizeof label);
-        double age_min = (up - (double)p.start / (double)hz) / 60.0;
-        double idle_min = s->idle_since ? (double)(now - s->idle_since) / 60.0 : 0;
-        char why[96], rl[64], verdict[96];
-        snprintf(why, sizeof why, "idle %.0f min, CPU %.1f%%, uptime %.0f min",
-                 idle_min, s->cpu_pct, age_min);
-        snprintf(rl, sizeof rl, "fz:%s", key);
-
-        const char *excl = fz_list_hit(&c->exclude, p.hay);
-        const char *never = excl ? 0 : fz_never(c, &p, label);
-        int forgotten = !excl && !never && age_min >= c->uptime_min &&
-                        s->idle_since && idle_min >= c->idle_min;
-        int optout = forgotten && ((!strcmp(kind, "java-big") && !c->java_big) ||
-                                   (!strcmp(kind, "gradle-daemon") && !c->gradle));
-
-        if (excl)                          snprintf(verdict, sizeof verdict, "excluded:%s", excl);
-        else if (never)                    snprintf(verdict, sizeof verdict, "never:%s", never);
-        else if (age_min < c->uptime_min) snprintf(verdict, sizeof verdict, "young");
-        else if (!s->sampled)              snprintf(verdict, sizeof verdict, "no-sample");
-        else if (!s->idle_since)           snprintf(verdict, sizeof verdict, "busy");
-        else if (!forgotten)               snprintf(verdict, sizeof verdict, "idle-%.0f-of-%d-min", idle_min, c->idle_min);
-        else if (optout)                   snprintf(verdict, sizeof verdict, "FORGOTTEN-opt-in-off");
-        else                               snprintf(verdict, sizeof verdict, "FORGOTTEN");
-
+        fz_cand k;
+        if (!fz_evaluate(c, fs, &p, now, dt, hz, up, &k)) continue;
+        char verdict[96];
+        fz_verdict(c, &k, verdict, sizeof verdict);
         appendf(st, sizeof st, &stlen,
                 "cand %d kind=%s rss_kb=%ld cpu=%.1f idle_min=%.0f age_min=%.0f verdict=%s name=%s\n",
-                pid, kind, p.rss_kb, s->cpu_pct, idle_min, age_min, verdict, label);
-
-        if (!forgotten || optout || acted) continue;
-        if (!rate_ok(rl, 900)) continue;
-
-        if (c->monitor || c->dryrun || !c->autopilot) {
-            lg(LOG_NOTICE, "freeze[monitor]: would freeze %s(%d) kind=%s %ld MB | %s",
-               label, pid, kind, rss_mb, why);
-            rate_mark(rl);
-            acted = 1;
-            continue;
-        }
-
-        /* GradleDaemon is not frozen: a frozen daemon silently hangs the next
-         * build because the client waits on its socket. The daemon is a cache and
-         * a new one starts by itself, so a forgotten one gets a regular SIGTERM. */
-        if (!strcmp(kind, "gradle-daemon")) {
-            if (kill(pid, SIGTERM) != 0) {
-                lg(LOG_ERR, "freeze: SIGTERM to GradleDaemon(%d) failed: %s", pid, strerror(errno));
-                continue;
-            }
-            lg(LOG_WARNING, "terminated: gradle daemon(%d) rss %ld kB | %s", pid, p.rss_kb, why);
-            rate_mark(rl);
-            acted = 1;
-            continue;
-        }
-
-        if (fz_freeze(c, &p, kind, label, why) == 0) { rate_mark(rl); acted = 1; }
+                pid, k.kind, p.rss_kb, k.cpu_pct, k.idle_min, k.age_min, verdict, k.label);
+        if (k.forgotten && !k.optout && !acted) acted = fz_act(c, &p, &k);
     }
     closedir(d);
     for (int i = 0; i < FZ_MAXCAND; i++)
         if (fs->slots[i].key[0] && fs->slots[i].last_seen != now) fs->slots[i].key[0] = 0;
-
-    char sp[PATHMAX], tmp[PATHMAX + 32];
-    snprintf(sp, sizeof sp, "%s/freeze.state", c->state_dir);
-    snprintf(tmp, sizeof tmp, "%s.tmp", sp);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd >= 0) {
-        ssize_t w = write(fd, st, stlen);
-        close(fd);
-        if (w == (ssize_t)stlen) rename(tmp, sp); else unlink(tmp);
-    }
+    fz_state_write(c, st, stlen);
 }
-
 
 /* ================================= main ================================== */
 
