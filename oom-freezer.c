@@ -706,8 +706,12 @@ static int fz_collect(const fz_config *c, const fz_proc *p, const char *label, i
     }
     int n = fz_tree(p->pid, pids, cap);
     if (n < 1) { lg(LOG_WARNING, "freeze cancelled: incomplete process tree"); return -1; }
-    for (int i = 0; i < n; i++) if (pid_protected(pids[i], &c->protect) || holds_gpu(pids[i])) {
-        lg(LOG_WARNING, "freeze cancelled: protected descendant"); return -1;
+    for (int i = 1; i < n; i++) {
+        static fz_proc d;
+        const char *why = fz_own(pids[i]) ? "own-tree" : pid_protected(pids[i], &c->protect) ? "protected" : 0;
+        if (!why && fz_read(pids[i], &d) == 0) why = fz_never(c, &d, "");
+        if (!why && holds_gpu(pids[i])) why = "gui-dri";
+        if (why) { lg(LOG_WARNING, "freeze cancelled: descendant %d refused (%s)", pids[i], why); return -1; }
     }
     return n;
 }

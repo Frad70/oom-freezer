@@ -6,6 +6,7 @@ static char *test_cgroup_mnt = "/proc/oom-freezer-tests-never-created";
 #include "oom-freezer.c"
 #undef main
 #include <sys/wait.h>
+#include <sys/prctl.h>
 
 static int failures;
 #define EXPECT(c, message) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", message); failures++; } } while (0)
@@ -171,6 +172,29 @@ static void scan_tests(fz_config *c, const char *state) {
     cfg_defaults(c); c->state_dir = state;
 }
 
+/* A candidate whose descendant has a sacred name must be refused as a whole. */
+static void descendant_tests(fz_config *c) {
+    const char *names[] = {"pipewire-fix", "plain-fix"};
+    for (int k = 0; k < 2; k++) {
+        int hold[2], ready[2];
+        if (pipe(hold) || pipe(ready)) { failures++; return; }
+        pid_t root = fork();
+        if (!root) {
+            close(hold[1]);
+            if (!fork()) { prctl(PR_SET_NAME, names[k]); (void)!write(ready[1], "r", 1); char b; (void)!read(hold[0], &b, 1); _exit(0); }
+            char b; (void)!read(hold[0], &b, 1); _exit(0);
+        }
+        char b; (void)!read(ready[0], &b, 1);
+        fz_proc p; int pids[8], tn = 0;
+        for (int w = 0; w < 100 && (tn = fz_tree(root, pids, 8)) < 2; w++) usleep(10000);
+        EXPECT(fz_read(root, &p) == 0 && tn == 2, "descendant fixture");
+        int got = fz_collect(c, &p, "x", pids, 8);
+        EXPECT(k == 0 ? got < 0 : got == 2, k == 0 ? "a sacred descendant refuses the whole tree" : "an ordinary descendant is accepted");
+        close(hold[1]); waitpid(root, NULL, 0); wait(NULL);
+        close(hold[0]); close(ready[0]); close(ready[1]);
+    }
+}
+
 int main(void) {
     static fz_config cfg; fz_config *c = &cfg;
     cfg_defaults(c);
@@ -302,6 +326,7 @@ int main(void) {
         close(pipes[1]); waitpid(child, NULL, 0);
     } else close(pipes[1]);
 
+    descendant_tests(c);
     char state[] = "/tmp/oom-freezer-registry-XXXXXX";
     EXPECT(mkdtemp(state), "registry fixture"); c->state_dir = state;
     char path[PATHMAX], actual[2048]; snprintf(path, sizeof path, "%s/frozen", state);
